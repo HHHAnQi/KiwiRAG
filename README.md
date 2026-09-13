@@ -29,9 +29,6 @@ KiwiRAG 是一个面向生产环境的私有知识库问答平台。它覆盖从
 | :---: | :---: |
 | ![知识库管理界面](docs/assets/knowledge-management.png) | ![Agent API 审计界面](docs/assets/api-audit-swagger.png) |
 
-> 当前仓库暂缺“正常问答 + 引用卡片”的完整截图。错误状态截图保留在
-> [前端已知限制](#当前限制)中，不将异常路径作为项目首屏体验。
-
 ## 为什么选择 KiwiRAG
 
 | 常见 RAG Demo | KiwiRAG |
@@ -89,6 +86,35 @@ flowchart TB
 MySQL 是事实源，Milvus 是可重建的派生索引。召回后会回库校验租户、软删除状态和 generation，
 以避免索引与权限漂移。更完整的读写路径和模块关系见
 [架构文档](docs/architecture/architecture-diagrams.md)。
+
+### Agentic RAG 执行循环
+
+Agentic RAG 是 KiwiRAG 中已实现的实验执行策略。它共享相同的检索、权限和引用基础设施，
+但在检索之上增加了有界规划、工具执行、证据充分性判断和增量重规划：
+
+```mermaid
+flowchart TD
+    Q[用户问题] --> REQ[Requirement Extraction<br/>冻结问题约束]
+    REQ --> PLAN[Planner<br/>生成有界执行计划]
+    PLAN --> TOOL[Tool Execution<br/>semantic / keyword / metadata search]
+    TOOL --> EVID[Evidence Set<br/>保留来源与已尝试查询]
+    EVID --> JUDGE{Sufficiency Judge<br/>证据是否充分?}
+
+    JUDGE -->|充分| COMPOSE[Grounded Composer<br/>基于证据生成]
+    JUDGE -->|不足且预算可用| REPLAN[Incremental Replan<br/>补充缺失证据]
+    REPLAN --> TOOL
+    JUDGE -->|预算耗尽或不可回答| FALLBACK[Abstain / Classic Fallback]
+
+    COMPOSE --> CITE[Citation Alignment]
+    FALLBACK --> RESULT[最终响应]
+    CITE --> RESULT
+    RESULT --> AUDIT[Agent Run Audit<br/>steps / status / decision summary]
+```
+
+该循环受步骤数、工具调用、LLM 调用、Token、成本和总时长预算约束，避免无界规划。
+当前评测中，修复后的 Agentic 路径与 Classic 质量基本持平，但延迟约为 **2.8×**，
+因此默认保持关闭（`RAG_AGENT_PLANNER_ENABLED=false`）。何时值得启用 Agentic 路径，
+见 [何时使用 Agentic RAG](docs/agentic/WHEN_TO_USE_AGENTIC_RAG.md)。
 
 ## 快速开始
 
