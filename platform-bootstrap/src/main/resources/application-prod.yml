@@ -44,15 +44,6 @@ rag:
   citation-verifier:
     enabled: true
     on-fail: WARN_ONLY   # 观察 2 个版本后视指标决定是否收紧 REFUSE
-
-llm:
-  api-key: ${LLM_API_KEY:}          # 无默认 — 环境变量必填
-  fallback-api-key: ${LLM_FALLBACK_API_KEY:}
-embedding:
-  api-key: ${EMBEDDING_API_KEY:}
-  base-url: ${EMBEDDING_BASE_URL:}  # 无默认 — 不允许静默回落本地 8082
-
-rag:
   agent:
     # 补③修复: prod 全关(A/B评测结论: 当前语料Agentic不敌Classic)
     planner:
@@ -70,3 +61,10 @@ rag:
       enabled: true  # prod启用(多实例需要)
     budget:
       max-total-tokens: ${RAG_AGENT_BUDGET_MAX_TOTAL_TOKENS:50000}
+
+llm:
+  api-key: ${LLM_API_KEY:}          # 无默认 — 环境变量必填
+  fallback-api-key: ${LLM_FALLBACK_API_KEY:}
+embedding:
+  api-key: ${EMBEDDING_API_KEY:}
+  base-url: ${EMBEDDING_BASE_URL:}  # 无默认 — 不允许静默回落本地 8082
