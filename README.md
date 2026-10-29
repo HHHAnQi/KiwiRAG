@@ -205,6 +205,7 @@ MySQL、Milvus、MinIO 及 Embedding 服务集成。
 | 主题 | 入口 |
 | --- | --- |
 | 架构与核心数据流 | [Architecture Diagrams](docs/architecture/architecture-diagrams.md) |
+| 生产化加固范围与验证边界 | [NFR Production Hardening](docs/architecture/nfr-production-hardening.md) |
 | 评测方法、冻结结果与证据 | [Evaluation](docs/evaluation/) · [Claim → Evidence](docs/evaluation/CLAIM_EVIDENCE_MATRIX.md) |
 | 可靠接入与故障注入 | [Fault Injection Report](docs/reliability/FAULT_INJECTION_REPORT.md) |
 | Agentic RAG 的适用边界 | [When to Use Agentic RAG](docs/agentic/WHEN_TO_USE_AGENTIC_RAG.md) |

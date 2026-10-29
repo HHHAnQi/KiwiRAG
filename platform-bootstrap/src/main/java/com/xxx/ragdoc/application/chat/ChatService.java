@@ -423,7 +423,7 @@ public class ChatService {
         // Task 7 / V13 Citation Verification: 在 OK 决定后, 写 history 前插 NLI 核验
         //   - WARN_ONLY: 仅 score 写入 citations.verifyScore, 不改 hint
         //   - REFUSE: score < threshold → hint=VERIFY_FAILED, answer=拒答模板
-        //   - REGENERATE: score < threshold → 重新调 LLM (最多 maxRegenerateAttempts 次)
+        //   - REGENERATE: 当前版本在配置绑定阶段明确拒绝
         com.xxx.ragdoc.application.chat.verification.VerificationResult verification = null;
         if (hint == StateHint.OK && citationVerificationCoordinator != null) {
             CitationVerificationCoordinator.Result verified =

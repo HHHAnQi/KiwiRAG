@@ -122,8 +122,8 @@ rag:
   citation-verifier:
     enabled: ${RAG_CITATION_VERIFIER_ENABLED:false}
     score-threshold: ${RAG_CITATION_VERIFIER_THRESHOLD:0.5}
-    on-fail: ${RAG_CITATION_VERIFIER_ON_FAIL:REFUSE}    # REFUSE | REGENERATE | WARN_ONLY
-    max-regenerate-attempts: ${RAG_CITATION_VERIFIER_MAX_REGEN:1}
+    # 当前版本只支持 REFUSE | WARN_ONLY; REGENERATE 会在启动时被拒绝。
+    on-fail: ${RAG_CITATION_VERIFIER_ON_FAIL:REFUSE}
     timeout-ms: ${RAG_CITATION_VERIFIER_TIMEOUT_MS:8000}
 
   # ─── Task 8 / V14 RAG Security (prompt-injection scanner) ───

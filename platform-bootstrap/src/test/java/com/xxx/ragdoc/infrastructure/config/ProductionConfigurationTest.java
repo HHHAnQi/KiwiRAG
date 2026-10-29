@@ -33,6 +33,9 @@ class ProductionConfigurationTest {
                 .isEqualTo(false);
         assertThat(properties.getProperty("rag.parser.mode")).isEqualTo("async");
         assertThat(properties.getProperty("rag.retrieve.mode")).isEqualTo("hybrid");
+        assertThat(properties.getProperty("rag.citation-verifier.enabled")).isEqualTo(true);
+        assertThat(properties.getProperty("rag.citation-verifier.on-fail"))
+                .isIn("REFUSE", "WARN_ONLY");
         assertThat(properties.getProperty("rag.agent.planner.enabled")).isEqualTo(false);
         assertThat(properties.getProperty("rag.agent.lease.enabled")).isEqualTo(true);
     }
