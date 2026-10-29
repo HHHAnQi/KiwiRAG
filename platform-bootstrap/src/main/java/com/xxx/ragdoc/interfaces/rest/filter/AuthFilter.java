@@ -3,20 +3,16 @@ package com.xxx.ragdoc.interfaces.rest.filter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xxx.ragdoc.application.auth.AuthContext;
 import com.xxx.ragdoc.application.auth.AuthProperties;
+import com.xxx.ragdoc.application.auth.AuthenticationPort;
 import com.xxx.ragdoc.domain.auth.Principal;
-import com.xxx.ragdoc.infrastructure.persistence.jpa.entity.PrincipalEntity;
-import com.xxx.ragdoc.infrastructure.persistence.jpa.repository.PrincipalJpaRepository;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -55,19 +51,13 @@ public class AuthFilter extends OncePerRequestFilter {
 
     private static final String BEARER_PREFIX = "Bearer ";
 
-    /**
-     * 用 {@link ObjectProvider} 可选注入 — 切片测试 (@WebMvcTest 不装 JPA Repositories) 也能装配; 生产环境 JPA 完整加载,
-     * repo 始终存在。
-     */
-    private final ObjectProvider<PrincipalJpaRepository> repoProvider;
-
+    private final AuthenticationPort authenticationPort;
     private final AuthProperties authProperties;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public AuthFilter(
-            ObjectProvider<PrincipalJpaRepository> repoProvider, AuthProperties authProperties) {
-        this.repoProvider = repoProvider;
+    public AuthFilter(AuthenticationPort authenticationPort, AuthProperties authProperties) {
+        this.authenticationPort = authenticationPort;
         this.authProperties = authProperties;
     }
 
@@ -108,7 +98,7 @@ public class AuthFilter extends OncePerRequestFilter {
             // 4) DB 解析 token; 未知 token / DB 异常 → 401 (不 fallback)
             Principal p;
             try {
-                p = resolveFromDb(token);
+                p = authenticationPort.authenticate(token).orElse(null);
             } catch (RuntimeException dbEx) {
                 log.warn(
                         "auth.db_error token={}..., error={}",
@@ -164,33 +154,6 @@ public class AuthFilter extends OncePerRequestFilter {
             throw new IllegalArgumentException("bearer token 不能为空");
         }
         return token;
-    }
-
-    /** token → Principal; repo 缺失 (切片测试) 或查不到 → null (caller 决定是 401 还是 fallback)。 */
-    private Principal resolveFromDb(String token) {
-        PrincipalJpaRepository repo = repoProvider.getIfAvailable();
-        if (repo == null) {
-            log.warn("auth.principal_repo_unavailable (slice test?)");
-            return null;
-        }
-        return repo.findByToken(token).map(AuthFilter::toDomain).orElse(null);
-    }
-
-    private static Principal toDomain(PrincipalEntity e) {
-        Set<String> roles = parseRoles(e.getRoles());
-        return new Principal(e.getTenantId(), e.getUserId(), roles, e.getToken());
-    }
-
-    private static Set<String> parseRoles(String csv) {
-        Set<String> roles = new LinkedHashSet<>();
-        roles.add("role:default");
-        if (StringUtils.hasText(csv)) {
-            for (String r : csv.split(",")) {
-                String trimmed = r.trim();
-                if (!trimmed.isEmpty()) roles.add(trimmed);
-            }
-        }
-        return roles;
     }
 
     // ─── 401 response helpers ───────────────────────────────
