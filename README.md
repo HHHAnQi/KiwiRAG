@@ -184,6 +184,7 @@ make down
 ```text
 KiwiRAG/
 ├── platform-common/       # Domain、Port、共享模型与核心能力
+├── platform-ingestion-adapters/ # Chat/Parser 共用的 JPA、Milvus、MinIO 与 Embedding 适配器
 ├── platform-bootstrap/    # Spring Boot 应用和在线 RAG Pipeline
 ├── parser-service/        # MQ 驱动的可靠文档解析与索引
 ├── frontend/              # React 19 + Vite 前端
@@ -193,6 +194,11 @@ KiwiRAG/
 ├── docs/                  # 架构、ADR、评测、可靠性和运维文档
 └── .github/workflows/     # 后端、前端和评测 CI
 ```
+
+模块依赖保持单向：`platform-bootstrap` 和 `parser-service` 只依赖
+`platform-common` 与 `platform-ingestion-adapters`，两个可执行服务之间没有编译依赖。
+Parser 通过 `platform-common` 中的端口和消息契约处理任务，共享适配器模块负责与
+MySQL、Milvus、MinIO 及 Embedding 服务集成。
 
 ## 深入文档
 
