@@ -8,6 +8,7 @@ plugins {
 
 dependencies {
     implementation(project(":platform-common"))
+    implementation(project(":platform-ingestion-adapters"))
 
     // Spring Boot starters
     implementation("org.springframework.boot:spring-boot-starter-web")
