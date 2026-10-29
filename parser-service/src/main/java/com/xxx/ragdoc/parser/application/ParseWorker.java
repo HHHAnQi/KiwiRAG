@@ -6,9 +6,9 @@ import com.xxx.ragdoc.application.document.chunking.ChunkingProperties;
 import com.xxx.ragdoc.application.document.chunking.ChunkingService;
 import com.xxx.ragdoc.application.document.ingestion.IngestionPolicy;
 import com.xxx.ragdoc.application.document.port.ChunkRepository;
-import com.xxx.ragdoc.application.document.port.DocumentRepository;
 import com.xxx.ragdoc.application.document.port.FileStorage;
 import com.xxx.ragdoc.application.document.port.ParseTaskRepository;
+import com.xxx.ragdoc.application.document.port.ParserDocumentRepository;
 import com.xxx.ragdoc.application.document.port.VectorStore;
 import com.xxx.ragdoc.domain.document.Chunk;
 import com.xxx.ragdoc.domain.document.ChunkType;
@@ -50,7 +50,7 @@ public class ParseWorker {
 
     private static final int MAX_TEXT_LENGTH = 5_000_000;
 
-    private final DocumentRepository documentRepository;
+    private final ParserDocumentRepository documentRepository;
     private final FileStorage fileStorage;
     private final ChunkingService chunkingService;
     private final EmbeddingClient embeddingClient;

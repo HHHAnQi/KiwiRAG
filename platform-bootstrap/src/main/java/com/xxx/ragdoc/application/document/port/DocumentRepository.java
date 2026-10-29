@@ -16,17 +16,13 @@ import org.springframework.data.domain.Pageable;
  *
  * <p>命名约定:端口接口放 application 包;adapter 实现放 infrastructure 包。 这是六边形 / DDD 标准 DIP 结构。
  */
-public interface DocumentRepository {
+public interface DocumentRepository extends ParserDocumentRepository {
 
     /** 保存(新建 + 状态更新共用)。 V1 简化:不做显式 save + update 区分,JPA merge 由实现层处理。 */
-    Document save(Document document);
-
     /** 按租户 + 内容 hash 查询；幂等边界必须与数据库唯一约束一致。 */
     Optional<Document> findByContentHash(ContentHash hash, String tenantId);
 
     /** 按 id 查(默认仅查未软删,V4 多租户化后强制带 tenantId)。 */
-    Optional<Document> findById(Long id);
-
     /**
      * 按 id 查 visibility(TENANT/PUBLIC/PRIVATE)。V9 加列但 Document 聚合未携带, 供 DocumentAccessGuard 做
      * PRIVATE 判定; 不存在返 empty, 调用方按保守默认处理。

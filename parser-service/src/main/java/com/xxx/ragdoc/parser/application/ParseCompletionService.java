@@ -1,7 +1,7 @@
 package com.xxx.ragdoc.parser.application;
 
-import com.xxx.ragdoc.application.document.port.DocumentRepository;
 import com.xxx.ragdoc.application.document.port.GenerationCleanupRepository;
+import com.xxx.ragdoc.application.document.port.ParserDocumentRepository;
 import com.xxx.ragdoc.domain.document.Chunk;
 import com.xxx.ragdoc.domain.document.Document;
 import com.xxx.ragdoc.domain.document.ParseTask;
@@ -14,7 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 @RequiredArgsConstructor
 public class ParseCompletionService {
-    private final DocumentRepository documentRepository;
+    private final ParserDocumentRepository documentRepository;
     private final ParseTaskService parseTaskService;
     private final GenerationCleanupRepository generationCleanupRepository;
 
