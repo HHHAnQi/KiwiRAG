@@ -1,5 +1,6 @@
 package com.xxx.ragdoc.infrastructure.mq;
 
+import com.xxx.ragdoc.application.document.ingestion.ParseTaskSubmitMessage;
 import com.xxx.ragdoc.domain.document.ParseTask;
 import com.xxx.ragdoc.domain.shared.TraceId;
 import java.time.Clock;

@@ -1,10 +1,10 @@
 package com.xxx.ragdoc.parser.infrastructure;
 
+import com.xxx.ragdoc.application.document.ingestion.ParseTaskSubmitMessage;
 import com.xxx.ragdoc.application.document.port.DocumentRepository;
 import com.xxx.ragdoc.application.document.port.ParseTaskRepository;
 import com.xxx.ragdoc.domain.document.Document;
 import com.xxx.ragdoc.domain.document.ParseTask;
-import com.xxx.ragdoc.infrastructure.mq.ParseTaskSubmitMessage;
 import com.xxx.ragdoc.parser.application.ParseCompletionService;
 import com.xxx.ragdoc.parser.application.ParseTaskService;
 import com.xxx.ragdoc.parser.application.ParseWorker;
