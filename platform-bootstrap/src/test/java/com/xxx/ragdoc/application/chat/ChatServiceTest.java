@@ -93,9 +93,11 @@ class ChatServiceTest {
         when(retrieveService.retrieve(any())).thenReturn(RetrieveService.RetrieveResult.empty());
         // traceObserver.startTrace 默认返回原 traceId 让内部链路对齐
         lenient().when(traceObserver.startTrace(any(), any(), any())).thenReturn(TID.value());
-        // Phase 1 / C4: @InjectMocks 对 setter 注入 @Autowired(required=false) 不一定可靠,
-        // 显式手动调 setter 强制注入 mock (mock 都是 @Mock 创建, 非 null, isMultiTurnEnabled() 应 true)
-        chatService.setConversationDeps(conversationStore, queryContextualizer, promptAssembler);
+        ConversationContextCoordinator contextCoordinator = new ConversationContextCoordinator();
+        contextCoordinator.setCoreDependencies(
+                conversationStore, queryContextualizer, promptAssembler);
+        ReflectionTestUtils.setField(
+                chatService, "conversationContextCoordinator", contextCoordinator);
     }
 
     @Nested

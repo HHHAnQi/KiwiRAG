@@ -5,10 +5,6 @@ import com.xxx.ragdoc.application.chat.command.ChatResult;
 import com.xxx.ragdoc.application.chat.command.ChatStreamEvent;
 import com.xxx.ragdoc.application.chat.conversation.ContextualizeResult;
 import com.xxx.ragdoc.application.chat.conversation.ConversationContext;
-import com.xxx.ragdoc.application.chat.conversation.port.ConversationStore;
-import com.xxx.ragdoc.application.chat.conversation.port.PromptAssemblerPort;
-import com.xxx.ragdoc.application.chat.conversation.port.QueryContextualizerPort;
-import com.xxx.ragdoc.application.chat.conversation.port.TopicShiftDetectorPort;
 import com.xxx.ragdoc.application.chat.port.ChatClient;
 import com.xxx.ragdoc.application.chat.port.TraceObserver;
 import com.xxx.ragdoc.application.document.port.DocumentRepository;
@@ -68,45 +64,17 @@ public class ChatService {
     // Phase 1 / C6: 用 ConversationProperties.compressThreshold 做 ChatService 内触发判定,
     // 防硬编码 6 但用户改 8 (compress 内部 needsCompression 拿不到更精确的紧致触发).
     // props 只在 conversation.enabled=true 时注入 (@ConditionalOnProperty on properties bean);
-    // 多轮路径已用 isMultiTurnEnabled 守门, props null 时 historyCompressor 也 null, 不进本 if.
+    // 多轮路径由 ConversationContextCoordinator 统一守门。
     @Autowired(required = false)
     private ConversationProperties conversationProperties;
-
-    // Phase 1 / C4 (ADR-0011 §7): 多轮对话 3 件 optional Bean, rag.conversation.enabled=false 时
-    // 不注入, 全 null → chat() 完全走 stateless 老路径 (baseline ±3pp gate 不破)
-    private ConversationStore conversationStore;
-    private QueryContextualizerPort queryContextualizer;
-    private PromptAssemblerPort promptAssembler;
-    // Phase 1 / C5 (ADR-0011 §5): topic shift 检测器, rag.conversation.topic-shift-detect=true
-    // 时注入。null 时视为永远 false (无 shift, 走正常多轮 rewrite)
-    private TopicShiftDetectorPort topicShiftDetector;
-
-    @Autowired(required = false)
-    public void setConversationDeps(
-            ConversationStore conversationStore,
-            QueryContextualizerPort queryContextualizer,
-            PromptAssemblerPort promptAssembler) {
-        this.conversationStore = conversationStore;
-        this.queryContextualizer = queryContextualizer;
-        this.promptAssembler = promptAssembler;
-        log.info(
-                "chat.multi_turn_enabled store={}, rewriter={}, promptAssembler={}",
-                conversationStore == null ? "none" : conversationStore.getClass().getSimpleName(),
-                queryContextualizer == null ? "none" : "QueryContextualizer",
-                promptAssembler == null ? "none" : "PromptAssembler");
-    }
-
-    @Autowired(required = false)
-    public void setTopicShiftDetector(TopicShiftDetectorPort topicShiftDetector) {
-        this.topicShiftDetector = topicShiftDetector;
-        log.info("chat.topic_shift_detector_enabled={}", topicShiftDetector != null);
-    }
 
     @Autowired private CitationVerificationCoordinator citationVerificationCoordinator;
 
     @Autowired private ChatResultFinalizer chatResultFinalizer;
 
     @Autowired private ConversationHistoryWriter conversationHistoryWriter;
+
+    @Autowired private ConversationContextCoordinator conversationContextCoordinator;
 
     /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
     @org.springframework.beans.factory.annotation.Autowired
@@ -116,11 +84,6 @@ public class ChatService {
     @org.springframework.beans.factory.annotation.Autowired
     private com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties
             onlineExecutionProperties;
-
-    /** 多轮对话是否启用 (3 件 Bean 全注入才表 enabled, 防 Redis 没起但 flag ON 的不一致)。 */
-    private boolean isMultiTurnEnabled() {
-        return conversationStore != null && queryContextualizer != null && promptAssembler != null;
-    }
 
     @Transactional
     public ChatResult chat(ChatCommand cmd, TraceId traceId) {
@@ -141,14 +104,14 @@ public class ChatService {
                 "chat.start trace_id={}, query_len={}, conv_enabled={}, conv_id={}",
                 traceId.value(),
                 cmd.query().length(),
-                isMultiTurnEnabled(),
+                conversationContextCoordinator.isEnabled(),
                 conversationId == null ? "(none)" : conversationId);
         // Phase 1 / C8 (ADR-0011 §11 Observability): trace metadata 加 conversation_id,
         // 让 Langfuse UI 按 conversation 关联多个 trace (同一会话多 turn 的视图)。
         // conversationId 为 null (老调用方 stateless) 时 metadata 加 "none", 不影响其他 trace 查询。
         java.util.Map<String, Object> startTraceMeta = new java.util.HashMap<>();
         startTraceMeta.put("query", cmd.query());
-        startTraceMeta.put("conv_enabled", isMultiTurnEnabled());
+        startTraceMeta.put("conv_enabled", conversationContextCoordinator.isEnabled());
         startTraceMeta.put("conversation_id", conversationId == null ? "(none)" : conversationId);
         // Task 9 / V15 trace enrichment: user_id (从 V9 AuthContext 拿, 让 Langfuse UI 按 user 关联)
         startTraceMeta.put(
@@ -156,7 +119,7 @@ public class ChatService {
         // Task 9: prompt_version + model_version 提前占位 (LLM observation 再覆盖实际值)
         startTraceMeta.put("prompt_version", resolvePromptVersion());
         startTraceMeta.put("model_version", chatClient.currentModel());
-        if (isMultiTurnEnabled()
+        if (conversationContextCoordinator.isEnabled()
                 && conversationProperties != null
                 && conversationId != null
                 && !conversationId.isBlank()) {
@@ -193,31 +156,13 @@ public class ChatService {
 
         // Phase 1 / C4+C5 (ADR-0011 §5 §7): 加载 ConversationContext + Query rewrite + Topic shift
         // (multi-turn 模式且 conversationId 非空才走; flag OFF 或没 ctx → stateless 老路径)
-        ConversationContext ctx = null;
-        boolean topicShift = false;
-        String retrieveQuery = cmd.query(); // 默认原 query
-        ContextualizeResult rewriteResult = null;
-        if (isMultiTurnEnabled() && conversationId != null && !conversationId.isBlank()) {
-            ctx =
-                    conversationStore
-                            .findById(conversationId)
-                            .orElseGet(
-                                    () -> {
-                                        // ctx 不存在 / TTL 过期 / store 异常 → 新建空 ctx
-                                        // (ConversationStore.findById 内部已 silent fallback)
-                                        ConversationContext fresh =
-                                                ConversationContext.empty(conversationId);
-                                        return fresh;
-                                    });
-            // Phase 1 / C5: 检测 topic shift (detector 在且 ctx 非首 turn 时才跑)
-            // shift=true 时跳过 history rewrite (但不强制 clear ctx, 保留 summary 作弱远期背景)
-            if (topicShiftDetector != null) {
-                topicShift = topicShiftDetector.isTopicShift(cmd.query(), ctx);
-            }
-            if (ctx.isEnabled() && !topicShift) {
-                rewriteResult = queryContextualizer.contextualize(cmd.query(), ctx.recentTurns());
-                retrieveQuery = rewriteResult.retrieveQuery();
-            }
+        ConversationContextCoordinator.PreparedContext preparedContext =
+                conversationContextCoordinator.prepare(cmd.query(), conversationId);
+        ConversationContext ctx = preparedContext.context();
+        boolean topicShift = preparedContext.topicShift();
+        String retrieveQuery = preparedContext.retrieveQuery();
+        ContextualizeResult rewriteResult = preparedContext.rewriteResult();
+        if (ctx != null) {
             traceObserver.observe(
                     lfTrace,
                     TraceObserver.ObservationType.DECISION,
@@ -500,7 +445,7 @@ public class ChatService {
         // LLM_DEGRADED / NO_RECALL / EMPTY_KB 一律不写, 否则下游 rewrite 把"出错了"当 fact 污染指代消解
         if (hint == StateHint.OK
                 && ctx != null
-                && isMultiTurnEnabled()
+                && conversationContextCoordinator.isEnabled()
                 && conversationId != null
                 && !conversationId.isBlank()) {
             conversationHistoryWriter.recordSuccessfulTurn(
@@ -557,7 +502,7 @@ public class ChatService {
                 "chat.stream_start trace_id={}, query_len={}, conv_enabled={}, conv_id={}",
                 traceId.value(),
                 cmd.query().length(),
-                isMultiTurnEnabled(),
+                conversationContextCoordinator.isEnabled(),
                 conversationId == null ? "(none)" : conversationId);
 
         // 1. docId 校验(同 chat 复用 4xx 路径)
@@ -579,23 +524,11 @@ public class ChatService {
 
         // 1b. P0 修复(SSE 多轮贯通): load ctx + topic shift + query rewrite (与 chat() 对齐)。
         // stateless 老调用方 (conversationId=null) 完全不进此分支。
-        ConversationContext ctx = null;
-        boolean topicShift = false;
-        String retrieveQuery = cmd.query();
-        if (isMultiTurnEnabled() && conversationId != null && !conversationId.isBlank()) {
-            ctx =
-                    conversationStore
-                            .findById(conversationId)
-                            .orElseGet(() -> ConversationContext.empty(conversationId));
-            if (topicShiftDetector != null) {
-                topicShift = topicShiftDetector.isTopicShift(cmd.query(), ctx);
-            }
-            if (ctx.isEnabled() && !topicShift) {
-                ContextualizeResult rewriteResult =
-                        queryContextualizer.contextualize(cmd.query(), ctx.recentTurns());
-                retrieveQuery = rewriteResult.retrieveQuery();
-            }
-        }
+        ConversationContextCoordinator.PreparedContext preparedContext =
+                conversationContextCoordinator.prepare(cmd.query(), conversationId);
+        ConversationContext ctx = preparedContext.context();
+        boolean topicShift = preparedContext.topicShift();
+        String retrieveQuery = preparedContext.retrieveQuery();
         final String finalStreamRetrieveQuery = retrieveQuery;
 
         // Phase 1.E (2026-08-03): SSE 路径 Langfuse trace 入口
@@ -790,7 +723,8 @@ public class ChatService {
                                                     retrieve.evidenceSnapshot());
                                             // P0 修复(SSE 多轮贯通): OK turn 写回 history (硬 gate:
                                             // 仅 OK 且非拒答才写, 防污染 rewrite) + 触发异步压缩。
-                                            if (!streamRefusal && isMultiTurnEnabled()) {
+                                            if (!streamRefusal
+                                                    && conversationContextCoordinator.isEnabled()) {
                                                 conversationHistoryWriter.recordSuccessfulTurn(
                                                         conversationId,
                                                         streamCtx,
@@ -897,9 +831,7 @@ public class ChatService {
             String traceId,
             String lfTrace) {
         String historyBlock = "";
-        if (ctx != null && ctx.isEnabled() && promptAssembler != null) {
-            historyBlock = promptAssembler.buildHistoryBlock(ctx, topicShift);
-        }
+        historyBlock = conversationContextCoordinator.buildHistoryBlock(ctx, topicShift);
         final boolean hasHistory = historyBlock != null && !historyBlock.isBlank();
 
         List<ChatResult.Citation> working = new ArrayList<>(retrievedCitations);

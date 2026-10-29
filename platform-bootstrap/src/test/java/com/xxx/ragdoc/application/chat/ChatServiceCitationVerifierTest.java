@@ -77,6 +77,10 @@ class ChatServiceCitationVerifierTest {
                 chatService,
                 "chatResultFinalizer",
                 new ChatResultFinalizer(chatTracesRepository, metrics));
+        ReflectionTestUtils.setField(
+                chatService,
+                "conversationContextCoordinator",
+                new ConversationContextCoordinator());
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");

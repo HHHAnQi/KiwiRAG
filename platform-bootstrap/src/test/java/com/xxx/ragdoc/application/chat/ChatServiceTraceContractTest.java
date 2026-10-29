@@ -61,6 +61,10 @@ class ChatServiceTraceContractTest {
                 chatService,
                 "chatResultFinalizer",
                 new ChatResultFinalizer(chatTracesRepository, metrics));
+        ReflectionTestUtils.setField(
+                chatService,
+                "conversationContextCoordinator",
+                new ConversationContextCoordinator());
         // 用户登录模拟 (Task 9: user_id 必须从 AuthContext 出来)
         AuthContext.set(
                 new com.xxx.ragdoc.domain.auth.Principal(

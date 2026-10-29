@@ -90,7 +90,11 @@ class ChatServiceStreamTerminalStateTest {
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");
         lenient().when(traceObserver.startTrace(any(), any(), any())).thenReturn(TID.value());
-        chatService.setConversationDeps(conversationStore, queryContextualizer, promptAssembler);
+        ConversationContextCoordinator contextCoordinator = new ConversationContextCoordinator();
+        contextCoordinator.setCoreDependencies(
+                conversationStore, queryContextualizer, promptAssembler);
+        ReflectionTestUtils.setField(
+                chatService, "conversationContextCoordinator", contextCoordinator);
     }
 
     /** 共用: 构造一条命中检索结果。 */
