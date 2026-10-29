@@ -98,10 +98,11 @@ class ChatServiceCitationVerifierTest {
         when(chatClient.chat(anyString(), anyList())).thenReturn("Sentinel 是流控组件");
         lenient().when(traceObserver.startTrace(any(), any(), any())).thenReturn(TID.value());
 
-        // verifier bean + properties injected
-        chatService.setCitationVerifier(citationVerifier);
-        ReflectionTestUtils.setField(
-                chatService, "citationVerifierProperties", citationVerifierProperties);
+        // verifier bean + properties injected through the dedicated coordinator
+        CitationVerificationCoordinator coordinator =
+                new CitationVerificationCoordinator(citationVerifierProperties, chatMessages);
+        coordinator.setVerifier(citationVerifier);
+        ReflectionTestUtils.setField(chatService, "citationVerificationCoordinator", coordinator);
         when(citationVerifierProperties.isEnabled()).thenReturn(true);
         when(citationVerifierProperties.getScoreThreshold()).thenReturn(0.5);
     }

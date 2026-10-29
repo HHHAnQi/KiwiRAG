@@ -119,21 +119,7 @@ public class ChatService {
         log.info("chat.history_compressor_enabled={}", historyCompressor != null);
     }
 
-    /** Task 7 / V13 Citation Verification: 可选注入 (rag.citation-verifier.enabled=true 时 Bean 才存在)。 */
-    @Autowired(required = false)
-    private com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort citationVerifier;
-
-    @Autowired(required = false)
-    public void setCitationVerifier(
-            com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort
-                    citationVerifier) {
-        this.citationVerifier = citationVerifier;
-        log.info("chat.citation_verifier_enabled={}", citationVerifier != null);
-    }
-
-    /** Task 7: verifier 配置 (always injected, 默认 disabled)。 */
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.CitationVerifierProperties citationVerifierProperties;
+    @Autowired private CitationVerificationCoordinator citationVerificationCoordinator;
 
     /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
     @org.springframework.beans.factory.annotation.Autowired
@@ -514,32 +500,13 @@ public class ChatService {
         //   - REFUSE: score < threshold → hint=VERIFY_FAILED, answer=拒答模板
         //   - REGENERATE: score < threshold → 重新调 LLM (最多 maxRegenerateAttempts 次)
         com.xxx.ragdoc.application.chat.verification.VerificationResult verification = null;
-        if (hint == StateHint.OK) {
-            verification = runCitationVerification(answer, citations);
-            if (verification != null) {
-                // 把 scores 写回 citations (供前端/评测观察)
-                citations = annotateCitationScores(citations, verification);
-                if (verification.outcome()
-                        == com.xxx.ragdoc.application.chat.verification.VerificationResult.Outcome
-                                .FAIL) {
-                    // FAIL 处理: REFUSE / REGENERATE / WARN_ONLY (在 runCitationVerification 内部决策;
-                    // 这里只更新 hint)
-                    if (verification.errorMessage() == null
-                            || !verification.errorMessage().startsWith("WARN_ONLY")) {
-                        // runCitationVerification 返 FAIL 且非 WARN_ONLY: hint 改 VERIFY_FAILED
-                        // (REGENERATE 已 exhausted, REFUSE 直接拒; WARN_ONLY errorMessage 标
-                        // "WARN_ONLY")
-                        hint = StateHint.VERIFY_FAILED;
-                        if (citationVerifierProperties.getOnFail()
-                                == com.xxx.ragdoc.application.chat.CitationVerifierProperties.OnFail
-                                        .REFUSE) {
-                            answer =
-                                    chatMessages.verifierRefusal(
-                                            citationVerifierProperties.getScoreThreshold());
-                        }
-                    }
-                }
-            }
+        if (hint == StateHint.OK && citationVerificationCoordinator != null) {
+            CitationVerificationCoordinator.Result verified =
+                    citationVerificationCoordinator.verify(answer, citations);
+            answer = verified.answer();
+            hint = verified.stateHint();
+            citations = verified.citations();
+            verification = verified.verification();
         }
 
         // Phase 1 / C4 (ADR-0011 §6 + §8.2 G3): 写回 history — 仅当 OK turn 才允许 (硬 gate 防污染)
@@ -1294,91 +1261,6 @@ public class ChatService {
      *
      * <p>False positive 风险: 真正常回答 ≤20 字 + 含这些 marker 极少 (length gate 守门)。
      */
-    // ─── Task 7 / V13 Citation Verification helpers ───────────────────
-
-    /**
-     * 运行 citation 验证; 返 null 表示未启用 (properties disabled 或 verifier bean 未注入)。
-     *
-     * <p>语义: WARN_ONLY 时 FAIL 也返 VerificationResult.outcome=FAIL, errorMessage 标 "WARN_ONLY: ..." 让
-     * caller 据此不改 hint; REFUSE/REGENERATE (耗尽) 时 outcome=FAIL + 无 WARN_ONLY 前缀。
-     *
-     * <p>REGENERATE 暂不真调 LLM 二次 (避免影响 streaming / token accounting 路径), 当作 REFUSE 处理 (javadoc 标注 +
-     * properties field 保留以便 Phase 3.B 接入)。
-     */
-    private com.xxx.ragdoc.application.chat.verification.VerificationResult runCitationVerification(
-            String answer, java.util.List<ChatResult.Citation> citations) {
-        if (citationVerifier == null
-                || citationVerifierProperties == null
-                || !citationVerifierProperties.isEnabled()) {
-            return null;
-        }
-        if (answer == null || citations == null || citations.isEmpty()) {
-            return null;
-        }
-        // 把 citations 转成 evidence list (用 llmContext 优先, fallback snippet)
-        java.util.List<
-                        com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort
-                                .Evidence>
-                evidences =
-                        citations.stream()
-                                .map(
-                                        c ->
-                                                new com.xxx.ragdoc.application.chat.verification
-                                                        .port.CitationVerifierPort.Evidence(
-                                                        c.chunkId() == null ? 0L : c.chunkId(),
-                                                        c.llmContext() == null
-                                                                ? c.snippet()
-                                                                : c.llmContext()))
-                                .toList();
-        com.xxx.ragdoc.application.chat.verification.VerificationResult r =
-                citationVerifier.verify(answer, evidences);
-        if (r.outcome()
-                        == com.xxx.ragdoc.application.chat.verification.VerificationResult.Outcome
-                                .FAIL
-                && citationVerifierProperties.getOnFail()
-                        == com.xxx.ragdoc.application.chat.CitationVerifierProperties.OnFail
-                                .WARN_ONLY) {
-            // WARN_ONLY: caller 据 errorMessage 不改 hint
-            return new com.xxx.ragdoc.application.chat.verification.VerificationResult(
-                    r.outcome(),
-                    r.overallScore(),
-                    r.citationScores(),
-                    "WARN_ONLY:fail_score=" + r.overallScore());
-        }
-        return r;
-    }
-
-    /** Task 7: 把 NLI scores 写回每条 citation.verifyScore (无对应 chunkId 的citation留 null)。 */
-    private static java.util.List<ChatResult.Citation> annotateCitationScores(
-            java.util.List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        if (citations == null || citations.isEmpty()) return citations;
-        if (verification == null
-                || verification.citationScores() == null
-                || verification.citationScores().isEmpty()) {
-            return citations;
-        }
-        java.util.Map<Long, Double> scoreByChunkId = new java.util.HashMap<>();
-        for (var s : verification.citationScores()) {
-            scoreByChunkId.put(s.chunkId(), s.score());
-        }
-        return citations.stream()
-                .map(
-                        c -> {
-                            Double s = c.chunkId() == null ? null : scoreByChunkId.get(c.chunkId());
-                            if (s == null) return c;
-                            return new ChatResult.Citation(
-                                    c.chunkId(),
-                                    c.docId(),
-                                    c.page(),
-                                    c.snippet(),
-                                    c.llmContext(),
-                                    c.sectionPath(),
-                                    s);
-                        })
-                .toList();
-    }
-
     // ─── Task 9 / V15 Langfuse trace enrichment helpers ──────────────
 
     /**
