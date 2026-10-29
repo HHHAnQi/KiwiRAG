@@ -65,6 +65,8 @@ public class RagdocMetrics implements MetricsPort {
     /** retrieve 召回的最终命中条数(=喂 LLM 的 context chunk 数)。 */
     public void recordRetrieveRecall(int count) {
         registry.summary("ragdoc.retrieve.recall_count").record(count);
+        registry.counter("ragdoc.retrieve.requests", "outcome", count == 0 ? "zero" : "hit")
+                .increment();
     }
 
     /** rerank 调用耗时(ms)。rerank disabled 不调。 */

@@ -1,0 +1,64 @@
+name: Environment NFR drills
+
+on:
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: Verification to execute on the tagged staging runner
+        required: true
+        type: choice
+        options:
+          - release-smoke
+          - parser-kill9
+          - performance-baseline
+
+permissions:
+  contents: read
+
+jobs:
+  staging-drill:
+    runs-on: [self-hosted, kiwirag-staging]
+    timeout-minutes: 45
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        if: inputs.drill == 'parser-kill9'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build parser artifact
+        if: inputs.drill == 'parser-kill9'
+        run: ./gradlew :parser-service:bootJar --no-daemon
+      - name: Crash recovery drill
+        if: inputs.drill == 'parser-kill9'
+        env:
+          CHAT_URL: ${{ vars.CHAT_URL }}
+          AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+          MYSQL_PASS: ${{ secrets.STAGING_MYSQL_PASSWORD }}
+          DRILL_FAST_LEASE: '1'
+        run: bash scripts/v3-kill-9-drill.sh
+      - name: Release smoke
+        if: inputs.drill == 'release-smoke'
+        env:
+          BASE_URL: ${{ vars.CHAT_URL }}
+          AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+        run: bash scripts/release/smoke.sh
+      - name: k6 performance baseline
+        if: inputs.drill == 'performance-baseline'
+        env:
+          CHAT_URL: ${{ vars.CHAT_URL }}
+          AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+          VUS: '20'
+          DURATION: 5m
+        run: k6 run --summary-export=k6-summary.json scripts/load/chat-sse-smoke.js
+      - name: Archive drill evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfr-drill-${{ inputs.drill }}-${{ github.run_id }}
+          path: |
+            /tmp/v3-kill-9-drill.log
+            /tmp/v3-kill-9-drill-parser.log
+            k6-summary.json
+          if-no-files-found: warn

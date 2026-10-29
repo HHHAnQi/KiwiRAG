@@ -144,3 +144,8 @@ Remaining execution gates are tracked in this order:
 6. Rolling deployment and rollback drill.
 7. Dependency, image, secret, and SBOM checks.
 
+Repository automation now supplies contract tests, dependency review, repository vulnerability
+scanning, alert/runbook consistency checks, a k6 SSE workload, and a release smoke script. These are
+gates and test instruments, not proof of production capacity. The fault drill, k6 baseline,
+Alertmanager delivery exercise, and rolling rollback still require an environment and archived run
+evidence before their corresponding claims become allowed.
