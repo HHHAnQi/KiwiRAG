@@ -95,6 +95,15 @@ class ChatServiceStreamTerminalStateTest {
                 conversationStore, queryContextualizer, promptAssembler);
         ReflectionTestUtils.setField(
                 chatService, "conversationContextCoordinator", contextCoordinator);
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatContextAssembler",
+                new ChatContextAssembler(
+                        contextCoordinator,
+                        chatMessages,
+                        new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder(),
+                        new com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties(),
+                        traceObserver));
     }
 
     /** 共用: 构造一条命中检索结果。 */

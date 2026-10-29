@@ -77,10 +77,18 @@ class ChatServiceCitationVerifierTest {
                 chatService,
                 "chatResultFinalizer",
                 new ChatResultFinalizer(chatTracesRepository, metrics));
+        ConversationContextCoordinator contextCoordinator = new ConversationContextCoordinator();
+        ReflectionTestUtils.setField(
+                chatService, "conversationContextCoordinator", contextCoordinator);
         ReflectionTestUtils.setField(
                 chatService,
-                "conversationContextCoordinator",
-                new ConversationContextCoordinator());
+                "chatContextAssembler",
+                new ChatContextAssembler(
+                        contextCoordinator,
+                        chatMessages,
+                        new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder(),
+                        new com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties(),
+                        traceObserver));
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");

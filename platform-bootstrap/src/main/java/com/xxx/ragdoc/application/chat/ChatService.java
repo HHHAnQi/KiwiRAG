@@ -76,14 +76,7 @@ public class ChatService {
 
     @Autowired private ConversationContextCoordinator conversationContextCoordinator;
 
-    /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder
-            tokenBudgetContextBuilder;
-
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties
-            onlineExecutionProperties;
+    @Autowired private ChatContextAssembler chatContextAssembler;
 
     @Transactional
     public ChatResult chat(ChatCommand cmd, TraceId traceId) {
@@ -303,10 +296,10 @@ public class ChatService {
                                                         c.sectionPath()))
                                 .toList();
                 // P0 修复(citations 错位): history block / LITM 重排 / token+char 预算 / citations
-                // 对齐统一收敛到 assembleContextWithHistory — 预算截断掉的 evidence 同步从 citations
+                // 对齐统一收敛到 ChatContextAssembler — 预算截断掉的 evidence 同步从 citations
                 // 移除, 保证 LLM 的 [n] 与前端引用卡片一一对应。
-                AssembledContext assembled =
-                        assembleContextWithHistory(
+                ChatContextAssembler.Result assembled =
+                        chatContextAssembler.assemble(
                                 ctx, topicShift, citations, traceId.value(), lfTrace);
                 List<String> context = assembled.context();
                 citations = assembled.citations();
@@ -610,7 +603,7 @@ public class ChatService {
         }
 
         // 4. 有召回: 拼 citations + context
-        // P0 修复(SSE 多轮贯通 + citations 错位): 与 chat() 同一 assembleContextWithHistory —
+        // P0 修复(SSE 多轮贯通 + citations 错位): 与 chat() 同一 ChatContextAssembler —
         // history block 进 context、LITM/budget 对齐 citations。SSE 发给前端的 CitationsEvent
         // 用对齐后的列表, 保证 [n] 与引用卡片一致。
         List<ChatResult.Citation> citations =
@@ -625,8 +618,8 @@ public class ChatService {
                                                 c.llmContext(),
                                                 c.sectionPath()))
                         .toList();
-        AssembledContext assembled =
-                assembleContextWithHistory(ctx, topicShift, citations, traceId.value(), lfTrace);
+        ChatContextAssembler.Result assembled =
+                chatContextAssembler.assemble(ctx, topicShift, citations, traceId.value(), lfTrace);
         List<String> context = assembled.context();
         citations = assembled.citations();
         final List<ChatResult.Citation> alignedCitations = citations;
@@ -810,135 +803,6 @@ public class ChatService {
 
         // 异常路径也要落 trace(LLM_DEGRADED 时 acc 包含部分答案; onErrorResume 已转 DoneEvent)
         return reactor.core.publisher.Flux.<ChatStreamEvent>just(head).concatWith(tokens);
-    }
-
-    /**
-     * P0 修复(citations 错位)统一组装: history block + LITM 重排 + token/char 双闸预算 + citations 对齐。
-     *
-     * <p>chat() 与 chatStream() 必须共用本方法, 保证两条主路径的 [n] 编号语义一致:
-     *
-     * <ul>
-     *   <li>history block (带 {@code <<CONVERSATION_HISTORY>>} marker) 作为 context 第 1 entry, LLM
-     *       client 渲染为不占 [n] 编号的独立段
-     *   <li>LITM 重排只作用于 evidence (history 不参与重排), 且 citations 同步重排保持配对
-     *   <li>预算截断后 kept 之外的 evidence 从返回的 citations 中移除 — LLM 只能给可见 evidence 标 [n], 前端卡片与 [n] 严格一一对应
-     * </ul>
-     */
-    private AssembledContext assembleContextWithHistory(
-            ConversationContext ctx,
-            boolean topicShift,
-            List<ChatResult.Citation> retrievedCitations,
-            String traceId,
-            String lfTrace) {
-        String historyBlock = "";
-        historyBlock = conversationContextCoordinator.buildHistoryBlock(ctx, topicShift);
-        final boolean hasHistory = historyBlock != null && !historyBlock.isBlank();
-
-        List<ChatResult.Citation> working = new ArrayList<>(retrievedCitations);
-        // Phase 2.A Upgrade A2: Lost-in-the-Middle 重排 (flag-driven, 默认 OFF=baseline 行为)
-        // 论文 Liu et al. 2023: LLM 在长 context 中对 [中间位置] 信息提取能力下降。
-        // citations 与 context 必须同步重排, 否则开启 LITM 时 [n] 与前端卡片错位。
-        if (chatMessages != null && chatMessages.isLitmReorder() && working.size() > 2) {
-            working = applyLitmReorderCitations(working);
-        }
-
-        List<String> context = new ArrayList<>();
-        if (hasHistory) {
-            context.add(historyBlock.trim());
-        }
-        for (var c : working) {
-            context.add(c.llmContext());
-        }
-        context = applyContextBudget(context, traceId, lfTrace);
-
-        int keptEntries = context.size();
-        int keptEvidence = hasHistory ? Math.max(0, keptEntries - 1) : keptEntries;
-        List<ChatResult.Citation> aligned =
-                List.copyOf(working.subList(0, Math.min(keptEvidence, working.size())));
-        if (aligned.size() < working.size()) {
-            log.info(
-                    "chat.citations_aligned_to_budget trace_id={}, kept={}/{}",
-                    traceId,
-                    aligned.size(),
-                    working.size());
-        }
-        return new AssembledContext(List.copyOf(context), aligned);
-    }
-
-    /** {@link #assembleContextWithHistory} 的结果: 对齐后的 context 与 citations。 */
-    private record AssembledContext(List<String> context, List<ChatResult.Citation> citations) {}
-
-    /**
-     * Phase 2.A Upgrade A2: Lost-in-the-Middle 重排的 citations 配对版本。
-     *
-     * <p>与 {@link #applyLostInTheMiddleReorder(List)} 同一排列算法, 但作用于 citation 列表 — llmContext 与
-     * citation 同源同序, 排 citation 即排 context。
-     */
-    static List<ChatResult.Citation> applyLitmReorderCitations(
-            List<ChatResult.Citation> sortedDesc) {
-        if (sortedDesc == null || sortedDesc.size() <= 2) {
-            return sortedDesc;
-        }
-        int n = sortedDesc.size();
-        List<ChatResult.Citation> out = new ArrayList<>(n);
-        out.add(sortedDesc.get(0)); // 头: 最高分
-        java.util.ArrayDeque<ChatResult.Citation> mid = new java.util.ArrayDeque<>();
-        for (int i = 2; i < n; i++) {
-            if ((i & 1) == 0) {
-                mid.addFirst(sortedDesc.get(i)); // i=2,4,...靠头侧
-            } else {
-                mid.addLast(sortedDesc.get(i)); // i=3,5,...靠尾侧
-            }
-        }
-        out.addAll(mid);
-        out.add(sortedDesc.get(1)); // 尾: 次高分
-        return out;
-    }
-
-    private List<String> applyContextBudget(List<String> context, String traceId, String lfTrace) {
-        int budget =
-                onlineExecutionProperties == null
-                        ? 3000
-                        : onlineExecutionProperties.getContextTokenBudget();
-        com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder builder =
-                tokenBudgetContextBuilder == null
-                        ? new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder()
-                        : tokenBudgetContextBuilder;
-        com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder.BuildResult built =
-                builder.build(
-                        context,
-                        budget,
-                        onlineExecutionProperties == null
-                                ? 3800
-                                : onlineExecutionProperties.getContextMaxChars());
-        traceObserver.observe(
-                lfTrace,
-                TraceObserver.ObservationType.DECISION,
-                "context.token_budget",
-                null,
-                Map.of(
-                        "estimated_tokens",
-                        built.estimatedTokens(),
-                        "token_budget",
-                        built.tokenBudget(),
-                        "truncated",
-                        built.truncated(),
-                        "reason_code",
-                        built.truncated()
-                                ? com.xxx.ragdoc.application.chat.router.OnlineReasonCode
-                                        .CONTEXT_TOKEN_BUDGET_APPLIED
-                                        .name()
-                                : "CONTEXT_WITHIN_BUDGET"),
-                0,
-                null);
-        if (built.truncated()) {
-            log.info(
-                    "chat.context_truncated trace_id={}, estimated_tokens={}, budget={}",
-                    traceId,
-                    built.estimatedTokens(),
-                    built.tokenBudget());
-        }
-        return built.context();
     }
 
     private static String reasonCodeFor(StateHint hint) {

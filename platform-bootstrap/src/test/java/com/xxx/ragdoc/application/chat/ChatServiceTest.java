@@ -98,6 +98,18 @@ class ChatServiceTest {
                 conversationStore, queryContextualizer, promptAssembler);
         ReflectionTestUtils.setField(
                 chatService, "conversationContextCoordinator", contextCoordinator);
+        ReflectionTestUtils.setField(
+                chatService, "chatContextAssembler", testContextAssembler(contextCoordinator));
+    }
+
+    private ChatContextAssembler testContextAssembler(
+            ConversationContextCoordinator contextCoordinator) {
+        return new ChatContextAssembler(
+                contextCoordinator,
+                chatMessages,
+                new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder(),
+                new com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties(),
+                traceObserver);
     }
 
     @Nested
