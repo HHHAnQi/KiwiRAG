@@ -47,6 +47,27 @@ flowchart TB
     L5 -.支撑.- L3
 ```
 
+### 2.1 Gradle Module Boundaries
+
+```mermaid
+flowchart BT
+    COMMON[platform-common<br/>Domain / Port / shared contracts]
+    ADAPTERS[platform-ingestion-adapters<br/>JPA / Milvus / MinIO / Embedding]
+    CHAT[platform-bootstrap<br/>online RAG executable]
+    PARSER[parser-service<br/>asynchronous parser executable]
+
+    ADAPTERS --> COMMON
+    CHAT --> COMMON
+    CHAT --> ADAPTERS
+    PARSER --> COMMON
+    PARSER --> ADAPTERS
+```
+
+`platform-bootstrap` 与 `parser-service` 是两个独立可执行服务，彼此不建立 Gradle 依赖。
+跨服务的消息结构、领域类型和应用端口放在 `platform-common`；两个服务都需要的
+入库与索引实现放在 `platform-ingestion-adapters`。这使 Parser 可以独立扩容，又避免依赖
+Chat 服务的启动模块。
+
 ## 3. Online RAG Serving Flow
 
 在线检索-生成主链（Classic 默认路径；ACL=回库校验，非 Milvus 内过滤完即止）：

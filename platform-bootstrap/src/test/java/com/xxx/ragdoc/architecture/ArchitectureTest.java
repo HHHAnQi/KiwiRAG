@@ -43,11 +43,6 @@ class ArchitectureTest {
             noClasses()
                     .that()
                     .resideInAPackage("..interfaces..")
-                    .and()
-                    .resideOutsideOfPackage(
-                            "..interfaces.rest.filter..") // V9: AuthFilter 是 web adapter, 解析 Bearer
-                    // token → domain.Principal 合法引用 infra
-                    // PrincipalRepository/Entity
                     .should()
                     .dependOnClassesThat()
                     .resideInAPackage("..infrastructure..");

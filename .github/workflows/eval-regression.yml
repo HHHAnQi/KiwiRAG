@@ -226,16 +226,23 @@ jobs:
 
       - name: Compare vs baseline
         id: compare
-        continue-on-error: true
         run: |
+          set +e
           python3 eval/compare_baseline.py \
             --baseline ${{ inputs.baseline_file || 'eval/baseline_v3_judge_plus.md' }} \
             --current eval/eval_ragas_report.md \
             --threshold ${{ inputs.threshold_pp || '3.0' }} \
             --output eval/regression_check.md
+          compare_exit_code=$?
+          set -e
 
-          # 把 exit code 暴露给后续 step
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
+          # 不让 shell -e 在记录前退出；由后续步骤区分回归与工具故障。
+          echo "exit_code=$compare_exit_code" >> "$GITHUB_OUTPUT"
+
+          if [ "$compare_exit_code" -ne 0 ] && [ "$compare_exit_code" -ne 2 ]; then
+            echo "::error::baseline comparison failed with exit code $compare_exit_code"
+            exit "$compare_exit_code"
+          fi
 
       - name: Upload eval artifacts
         if: always()

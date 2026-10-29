@@ -30,6 +30,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
@@ -78,11 +79,31 @@ class ChatServiceStreamTerminalStateTest {
 
     @BeforeEach
     void setup() {
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatResultFinalizer",
+                new ChatResultFinalizer(chatTracesRepository, metrics));
+        ConversationHistoryWriter historyWriter = new ConversationHistoryWriter();
+        historyWriter.setStore(conversationStore);
+        ReflectionTestUtils.setField(chatService, "conversationHistoryWriter", historyWriter);
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");
         lenient().when(traceObserver.startTrace(any(), any(), any())).thenReturn(TID.value());
-        chatService.setConversationDeps(conversationStore, queryContextualizer, promptAssembler);
+        ConversationContextCoordinator contextCoordinator = new ConversationContextCoordinator();
+        contextCoordinator.setCoreDependencies(
+                conversationStore, queryContextualizer, promptAssembler);
+        ReflectionTestUtils.setField(
+                chatService, "conversationContextCoordinator", contextCoordinator);
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatContextAssembler",
+                new ChatContextAssembler(
+                        contextCoordinator,
+                        chatMessages,
+                        new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder(),
+                        new com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties(),
+                        traceObserver));
     }
 
     /** 共用: 构造一条命中检索结果。 */

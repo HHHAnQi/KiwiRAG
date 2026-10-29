@@ -1,4 +1,4 @@
-package com.xxx.ragdoc.infrastructure.mq;
+package com.xxx.ragdoc.application.document.ingestion;
 
 import java.time.Instant;
 

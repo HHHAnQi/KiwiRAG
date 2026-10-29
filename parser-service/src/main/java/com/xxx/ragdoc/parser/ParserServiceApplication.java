@@ -14,15 +14,12 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * <p>纯 MQ 驱动消费 chat-app 发的 parse-task-submit, 完成异步解析 + 落库。 无 HTTP 入口(除 /actuator/health 用于 k3s
  * liveness probe)。
  *
- * <p><b>架构选择</b>: 为避免重复 infra 实现(MinioFileStorage / MilvusVectorStore / BgeM3EmbeddingClient /
- * Chunk/Document Jpa), parser-service 直接 project(":platform-bootstrap") 依赖, 复用其 infra adapter
- * 类(spec §6.1 parser-service 共享 schema + 共享基础设施)。本启动类用 ComponentScan filter:
+ * <p><b>架构选择</b>: parser-service 与 chat-app 共享 {@code platform-ingestion-adapters}中的 MinIO、
+ * Milvus、Embedding 和 JPA 适配器，但不依赖另一个可执行 Boot 模块。本启动类仅扫描 parser 与共享入库实现:
  *
  * <ul>
  *   <li>扫 {@code com.xxx.ragdoc.parser.*} (parser-service 自有 service / consumer / scheduler)
- *   <li>扫 {@code com.xxx.ragdoc.infrastructure.*} (复用 platform-bootstrap 的 infra adapter, 但 排除
- *       rerank 客户端 — parser 不调 rerank, 但 BgeRerankClient 依赖 RerankProperties 在 application.chat 包,
- *       不排除会触发 NoUniqueBean)
+ *   <li>扫 {@code com.xxx.ragdoc.infrastructure.*} (共享入库 adapter 模块)
  *   <li>扫 {@code com.xxx.ragdoc.application.document.chunking.*} (复用共享切片层, 注意 regex 必须匹配 {@code
  *       application\.chunk\..*} 而不是 {@code application\.chunk.*} 否则会把 chunking 一并排除)
  *   <li><b>排除</b> chat / feedback / ChunkController / BgeRerankClient 等 chat-app 业务 Bean (由
@@ -59,25 +56,6 @@ import org.springframework.scheduling.annotation.EnableScheduling;
                     type = FilterType.REGEX,
                     pattern =
                             "com\\.xxx\\.ragdoc\\.infrastructure\\.(llm|conversation|queryenhance|verification|trace|rerank)\\..*"),
-            // Release-hardening Phase5 实测回归: RerankHealthIndicator 依赖
-            // application.chat.RerankProperties
-            // (parser 已排除该包) → parser 启动失败。parser 解析链不需要 rerank, 一并排除。
-            // chat-app 专属能力自检 Runner: 依赖一堆 chat 侧 properties/router(已排除),
-            // parser 不需要; ASSIGNABLE_TYPE 精确到类。
-            @ComponentScan.Filter(
-                    type = FilterType.ASSIGNABLE_TYPE,
-                    classes = {
-                        com.xxx.ragdoc.infrastructure.config.RagCapabilityRegistry.class,
-                        // 依赖 application.document.DocumentManageService(不在 parser 扫描范围),
-                        // 属 chat-app 文档生命周期调度; parser 有自己的 VisibilityTimeoutScheduler。
-                        com.xxx.ragdoc.infrastructure.scheduler.MilvusDeleteSweeper.class,
-                        com.xxx.ragdoc.infrastructure.scheduler.VectorReconcileJob.class
-                    }),
-            // 排除仅 chat-app 用的 rerank client: 它依赖 RerankProperties(application.chat 包),
-            // parser 不调 rerank, 排除它解掉 NoUniqueBean
-            @ComponentScan.Filter(
-                    type = FilterType.ASSIGNABLE_TYPE,
-                    classes = com.xxx.ragdoc.infrastructure.rerank.BgeRerankClient.class),
         })
 @EntityScan(basePackages = {"com.xxx.ragdoc.infrastructure.persistence.jpa.entity"})
 @EnableJpaRepositories(basePackages = {"com.xxx.ragdoc.infrastructure.persistence.jpa.repository"})

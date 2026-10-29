@@ -5,29 +5,18 @@ import com.xxx.ragdoc.application.chat.command.ChatResult;
 import com.xxx.ragdoc.application.chat.command.ChatStreamEvent;
 import com.xxx.ragdoc.application.chat.conversation.ContextualizeResult;
 import com.xxx.ragdoc.application.chat.conversation.ConversationContext;
-import com.xxx.ragdoc.application.chat.conversation.ConversationContext.Turn;
-import com.xxx.ragdoc.application.chat.conversation.port.ConversationStore;
-import com.xxx.ragdoc.application.chat.conversation.port.HistoryCompressorPort;
-import com.xxx.ragdoc.application.chat.conversation.port.PromptAssemblerPort;
-import com.xxx.ragdoc.application.chat.conversation.port.QueryContextualizerPort;
-import com.xxx.ragdoc.application.chat.conversation.port.TopicShiftDetectorPort;
 import com.xxx.ragdoc.application.chat.port.ChatClient;
-import com.xxx.ragdoc.application.chat.port.ChatTracesRepository;
 import com.xxx.ragdoc.application.chat.port.TraceObserver;
 import com.xxx.ragdoc.application.document.port.DocumentRepository;
 import com.xxx.ragdoc.common.exception.DomainException;
 import com.xxx.ragdoc.common.exception.ErrorCode;
 import com.xxx.ragdoc.common.exception.NotFoundException;
-import com.xxx.ragdoc.domain.chat.ChatTrace;
 import com.xxx.ragdoc.domain.document.Document;
 import com.xxx.ragdoc.domain.document.DocumentStatus;
 import com.xxx.ragdoc.domain.shared.StateHint;
 import com.xxx.ragdoc.domain.shared.TraceId;
 // 架构债清理: 移除 infrastructure.conversation.* 直依赖, 改用 application 层端口 + ChatService 同包的
 // ConversationProperties
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -60,7 +49,6 @@ import org.springframework.transaction.annotation.Transactional;
 public class ChatService {
 
     private final DocumentRepository documentRepository;
-    private final ChatTracesRepository chatTracesRepository;
     private final ChatMessages chatMessages;
     // V2-B 新增
     private final RetrieveService retrieveService;
@@ -76,78 +64,19 @@ public class ChatService {
     // Phase 1 / C6: 用 ConversationProperties.compressThreshold 做 ChatService 内触发判定,
     // 防硬编码 6 但用户改 8 (compress 内部 needsCompression 拿不到更精确的紧致触发).
     // props 只在 conversation.enabled=true 时注入 (@ConditionalOnProperty on properties bean);
-    // 多轮路径已用 isMultiTurnEnabled 守门, props null 时 historyCompressor 也 null, 不进本 if.
+    // 多轮路径由 ConversationContextCoordinator 统一守门。
     @Autowired(required = false)
     private ConversationProperties conversationProperties;
 
-    // Phase 1 / C4 (ADR-0011 §7): 多轮对话 3 件 optional Bean, rag.conversation.enabled=false 时
-    // 不注入, 全 null → chat() 完全走 stateless 老路径 (baseline ±3pp gate 不破)
-    private ConversationStore conversationStore;
-    private QueryContextualizerPort queryContextualizer;
-    private PromptAssemblerPort promptAssembler;
-    // Phase 1 / C5 (ADR-0011 §5): topic shift 检测器, rag.conversation.topic-shift-detect=true
-    // 时注入。null 时视为永远 false (无 shift, 走正常多轮 rewrite)
-    private TopicShiftDetectorPort topicShiftDetector;
-    // Phase 1 / C6 (ADR-0011 §6 §9): 异步历史压缩器, rag.conversation.compress=true 时注入。
-    // null 时不触发压缩 (buffer 大小靠 PromptAssembler MAX=5 硬 cut 单层兜底)
-    private HistoryCompressorPort historyCompressor;
+    @Autowired private CitationVerificationCoordinator citationVerificationCoordinator;
 
-    @Autowired(required = false)
-    public void setConversationDeps(
-            ConversationStore conversationStore,
-            QueryContextualizerPort queryContextualizer,
-            PromptAssemblerPort promptAssembler) {
-        this.conversationStore = conversationStore;
-        this.queryContextualizer = queryContextualizer;
-        this.promptAssembler = promptAssembler;
-        log.info(
-                "chat.multi_turn_enabled store={}, rewriter={}, promptAssembler={}",
-                conversationStore == null ? "none" : conversationStore.getClass().getSimpleName(),
-                queryContextualizer == null ? "none" : "QueryContextualizer",
-                promptAssembler == null ? "none" : "PromptAssembler");
-    }
+    @Autowired private ChatResultFinalizer chatResultFinalizer;
 
-    @Autowired(required = false)
-    public void setTopicShiftDetector(TopicShiftDetectorPort topicShiftDetector) {
-        this.topicShiftDetector = topicShiftDetector;
-        log.info("chat.topic_shift_detector_enabled={}", topicShiftDetector != null);
-    }
+    @Autowired private ConversationHistoryWriter conversationHistoryWriter;
 
-    @Autowired(required = false)
-    public void setHistoryCompressor(HistoryCompressorPort historyCompressor) {
-        this.historyCompressor = historyCompressor;
-        log.info("chat.history_compressor_enabled={}", historyCompressor != null);
-    }
+    @Autowired private ConversationContextCoordinator conversationContextCoordinator;
 
-    /** Task 7 / V13 Citation Verification: 可选注入 (rag.citation-verifier.enabled=true 时 Bean 才存在)。 */
-    @Autowired(required = false)
-    private com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort citationVerifier;
-
-    @Autowired(required = false)
-    public void setCitationVerifier(
-            com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort
-                    citationVerifier) {
-        this.citationVerifier = citationVerifier;
-        log.info("chat.citation_verifier_enabled={}", citationVerifier != null);
-    }
-
-    /** Task 7: verifier 配置 (always injected, 默认 disabled)。 */
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.CitationVerifierProperties citationVerifierProperties;
-
-    /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder
-            tokenBudgetContextBuilder;
-
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties
-            onlineExecutionProperties;
-
-    /** 多轮对话是否启用 (3 件 Bean 全注入才表 enabled, 防 Redis 没起但 flag ON 的不一致)。 */
-    private boolean isMultiTurnEnabled() {
-        return conversationStore != null && queryContextualizer != null && promptAssembler != null;
-    }
+    @Autowired private ChatContextAssembler chatContextAssembler;
 
     @Transactional
     public ChatResult chat(ChatCommand cmd, TraceId traceId) {
@@ -168,14 +97,14 @@ public class ChatService {
                 "chat.start trace_id={}, query_len={}, conv_enabled={}, conv_id={}",
                 traceId.value(),
                 cmd.query().length(),
-                isMultiTurnEnabled(),
+                conversationContextCoordinator.isEnabled(),
                 conversationId == null ? "(none)" : conversationId);
         // Phase 1 / C8 (ADR-0011 §11 Observability): trace metadata 加 conversation_id,
         // 让 Langfuse UI 按 conversation 关联多个 trace (同一会话多 turn 的视图)。
         // conversationId 为 null (老调用方 stateless) 时 metadata 加 "none", 不影响其他 trace 查询。
         java.util.Map<String, Object> startTraceMeta = new java.util.HashMap<>();
         startTraceMeta.put("query", cmd.query());
-        startTraceMeta.put("conv_enabled", isMultiTurnEnabled());
+        startTraceMeta.put("conv_enabled", conversationContextCoordinator.isEnabled());
         startTraceMeta.put("conversation_id", conversationId == null ? "(none)" : conversationId);
         // Task 9 / V15 trace enrichment: user_id (从 V9 AuthContext 拿, 让 Langfuse UI 按 user 关联)
         startTraceMeta.put(
@@ -183,7 +112,7 @@ public class ChatService {
         // Task 9: prompt_version + model_version 提前占位 (LLM observation 再覆盖实际值)
         startTraceMeta.put("prompt_version", resolvePromptVersion());
         startTraceMeta.put("model_version", chatClient.currentModel());
-        if (isMultiTurnEnabled()
+        if (conversationContextCoordinator.isEnabled()
                 && conversationProperties != null
                 && conversationId != null
                 && !conversationId.isBlank()) {
@@ -220,31 +149,13 @@ public class ChatService {
 
         // Phase 1 / C4+C5 (ADR-0011 §5 §7): 加载 ConversationContext + Query rewrite + Topic shift
         // (multi-turn 模式且 conversationId 非空才走; flag OFF 或没 ctx → stateless 老路径)
-        ConversationContext ctx = null;
-        boolean topicShift = false;
-        String retrieveQuery = cmd.query(); // 默认原 query
-        ContextualizeResult rewriteResult = null;
-        if (isMultiTurnEnabled() && conversationId != null && !conversationId.isBlank()) {
-            ctx =
-                    conversationStore
-                            .findById(conversationId)
-                            .orElseGet(
-                                    () -> {
-                                        // ctx 不存在 / TTL 过期 / store 异常 → 新建空 ctx
-                                        // (ConversationStore.findById 内部已 silent fallback)
-                                        ConversationContext fresh =
-                                                ConversationContext.empty(conversationId);
-                                        return fresh;
-                                    });
-            // Phase 1 / C5: 检测 topic shift (detector 在且 ctx 非首 turn 时才跑)
-            // shift=true 时跳过 history rewrite (但不强制 clear ctx, 保留 summary 作弱远期背景)
-            if (topicShiftDetector != null) {
-                topicShift = topicShiftDetector.isTopicShift(cmd.query(), ctx);
-            }
-            if (ctx.isEnabled() && !topicShift) {
-                rewriteResult = queryContextualizer.contextualize(cmd.query(), ctx.recentTurns());
-                retrieveQuery = rewriteResult.retrieveQuery();
-            }
+        ConversationContextCoordinator.PreparedContext preparedContext =
+                conversationContextCoordinator.prepare(cmd.query(), conversationId);
+        ConversationContext ctx = preparedContext.context();
+        boolean topicShift = preparedContext.topicShift();
+        String retrieveQuery = preparedContext.retrieveQuery();
+        ContextualizeResult rewriteResult = preparedContext.rewriteResult();
+        if (ctx != null) {
             traceObserver.observe(
                     lfTrace,
                     TraceObserver.ObservationType.DECISION,
@@ -385,10 +296,10 @@ public class ChatService {
                                                         c.sectionPath()))
                                 .toList();
                 // P0 修复(citations 错位): history block / LITM 重排 / token+char 预算 / citations
-                // 对齐统一收敛到 assembleContextWithHistory — 预算截断掉的 evidence 同步从 citations
+                // 对齐统一收敛到 ChatContextAssembler — 预算截断掉的 evidence 同步从 citations
                 // 移除, 保证 LLM 的 [n] 与前端引用卡片一一对应。
-                AssembledContext assembled =
-                        assembleContextWithHistory(
+                ChatContextAssembler.Result assembled =
+                        chatContextAssembler.assemble(
                                 ctx, topicShift, citations, traceId.value(), lfTrace);
                 List<String> context = assembled.context();
                 citations = assembled.citations();
@@ -427,7 +338,7 @@ public class ChatService {
                                     hint.name(),
                                     "chat_latency_ms",
                                     System.currentTimeMillis() - t0Chat));
-                    return finishAndRecord(
+                    return chatResultFinalizer.finishAndRecord(
                             cmd,
                             traceId,
                             hint,
@@ -512,78 +423,26 @@ public class ChatService {
         // Task 7 / V13 Citation Verification: 在 OK 决定后, 写 history 前插 NLI 核验
         //   - WARN_ONLY: 仅 score 写入 citations.verifyScore, 不改 hint
         //   - REFUSE: score < threshold → hint=VERIFY_FAILED, answer=拒答模板
-        //   - REGENERATE: score < threshold → 重新调 LLM (最多 maxRegenerateAttempts 次)
+        //   - REGENERATE: 当前版本在配置绑定阶段明确拒绝
         com.xxx.ragdoc.application.chat.verification.VerificationResult verification = null;
-        if (hint == StateHint.OK) {
-            verification = runCitationVerification(answer, citations);
-            if (verification != null) {
-                // 把 scores 写回 citations (供前端/评测观察)
-                citations = annotateCitationScores(citations, verification);
-                if (verification.outcome()
-                        == com.xxx.ragdoc.application.chat.verification.VerificationResult.Outcome
-                                .FAIL) {
-                    // FAIL 处理: REFUSE / REGENERATE / WARN_ONLY (在 runCitationVerification 内部决策;
-                    // 这里只更新 hint)
-                    if (verification.errorMessage() == null
-                            || !verification.errorMessage().startsWith("WARN_ONLY")) {
-                        // runCitationVerification 返 FAIL 且非 WARN_ONLY: hint 改 VERIFY_FAILED
-                        // (REGENERATE 已 exhausted, REFUSE 直接拒; WARN_ONLY errorMessage 标
-                        // "WARN_ONLY")
-                        hint = StateHint.VERIFY_FAILED;
-                        if (citationVerifierProperties.getOnFail()
-                                == com.xxx.ragdoc.application.chat.CitationVerifierProperties.OnFail
-                                        .REFUSE) {
-                            answer =
-                                    chatMessages.verifierRefusal(
-                                            citationVerifierProperties.getScoreThreshold());
-                        }
-                    }
-                }
-            }
+        if (hint == StateHint.OK && citationVerificationCoordinator != null) {
+            CitationVerificationCoordinator.Result verified =
+                    citationVerificationCoordinator.verify(answer, citations);
+            answer = verified.answer();
+            hint = verified.stateHint();
+            citations = verified.citations();
+            verification = verified.verification();
         }
 
         // Phase 1 / C4 (ADR-0011 §6 + §8.2 G3): 写回 history — 仅当 OK turn 才允许 (硬 gate 防污染)
         // LLM_DEGRADED / NO_RECALL / EMPTY_KB 一律不写, 否则下游 rewrite 把"出错了"当 fact 污染指代消解
-        ConversationContext updatedCtx = null; // 用于 compress 触发判定
         if (hint == StateHint.OK
                 && ctx != null
-                && isMultiTurnEnabled()
+                && conversationContextCoordinator.isEnabled()
                 && conversationId != null
                 && !conversationId.isBlank()) {
-            try {
-                List<Long> citedChunkIds =
-                        citations.stream().map(ChatResult.Citation::chunkId).toList();
-                Turn thisTurn =
-                        new Turn(cmd.query(), answer, citedChunkIds, StateHint.OK, Instant.now());
-                updatedCtx = ctx.appendTurn(thisTurn);
-                conversationStore.save(updatedCtx);
-            } catch (Exception e) {
-                // 兜底: store 异常已在 ConversationStore 内 silent log, 此处再防一道 setProperty
-                log.warn(
-                        "chat.history_write_failed conv_id={}, reason={}",
-                        conversationId,
-                        e.getMessage());
-            }
-        }
-
-        // Phase 1 / C6 (ADR-0011 §6 §9): 异步触发压缩 (fire-and-forget)
-        // 仅当: ctx 写回成功 + compress 实例注入 + 当前 buffer >= compressThreshold 才走
-        // compress 内部 needsCompression 还有双重 check (debounce 1min + size≥threshold), 防 race
-        int threshold =
-                conversationProperties != null ? conversationProperties.getCompressThreshold() : 6;
-        if (updatedCtx != null
-                && historyCompressor != null
-                && updatedCtx.recentTurns() != null
-                && updatedCtx.recentTurns().size() >= threshold) {
-            try {
-                historyCompressor.compress(conversationId);
-            } catch (Exception e) {
-                // fire-and-forget 异常不应影响 chat 返回 (DiscardPolicy 队列满也作 silent)
-                log.debug(
-                        "chat.compress_submit_skipped conv_id={}, reason={}",
-                        conversationId,
-                        e.getMessage());
-            }
+            conversationHistoryWriter.recordSuccessfulTurn(
+                    conversationId, ctx, cmd.query(), answer, citations);
         }
 
         traceObserver.endTrace(
@@ -595,7 +454,7 @@ public class ChatService {
                         reasonCodeFor(hint),
                         "chat_latency_ms",
                         System.currentTimeMillis() - t0Chat));
-        return finishAndRecord(
+        return chatResultFinalizer.finishAndRecord(
                 cmd, traceId, hint, answer, citations, t0Chat, verification, evidenceForTrace);
     }
 
@@ -636,7 +495,7 @@ public class ChatService {
                 "chat.stream_start trace_id={}, query_len={}, conv_enabled={}, conv_id={}",
                 traceId.value(),
                 cmd.query().length(),
-                isMultiTurnEnabled(),
+                conversationContextCoordinator.isEnabled(),
                 conversationId == null ? "(none)" : conversationId);
 
         // 1. docId 校验(同 chat 复用 4xx 路径)
@@ -658,23 +517,11 @@ public class ChatService {
 
         // 1b. P0 修复(SSE 多轮贯通): load ctx + topic shift + query rewrite (与 chat() 对齐)。
         // stateless 老调用方 (conversationId=null) 完全不进此分支。
-        ConversationContext ctx = null;
-        boolean topicShift = false;
-        String retrieveQuery = cmd.query();
-        if (isMultiTurnEnabled() && conversationId != null && !conversationId.isBlank()) {
-            ctx =
-                    conversationStore
-                            .findById(conversationId)
-                            .orElseGet(() -> ConversationContext.empty(conversationId));
-            if (topicShiftDetector != null) {
-                topicShift = topicShiftDetector.isTopicShift(cmd.query(), ctx);
-            }
-            if (ctx.isEnabled() && !topicShift) {
-                ContextualizeResult rewriteResult =
-                        queryContextualizer.contextualize(cmd.query(), ctx.recentTurns());
-                retrieveQuery = rewriteResult.retrieveQuery();
-            }
-        }
+        ConversationContextCoordinator.PreparedContext preparedContext =
+                conversationContextCoordinator.prepare(cmd.query(), conversationId);
+        ConversationContext ctx = preparedContext.context();
+        boolean topicShift = preparedContext.topicShift();
+        String retrieveQuery = preparedContext.retrieveQuery();
         final String finalStreamRetrieveQuery = retrieveQuery;
 
         // Phase 1.E (2026-08-03): SSE 路径 Langfuse trace 入口
@@ -756,7 +603,7 @@ public class ChatService {
         }
 
         // 4. 有召回: 拼 citations + context
-        // P0 修复(SSE 多轮贯通 + citations 错位): 与 chat() 同一 assembleContextWithHistory —
+        // P0 修复(SSE 多轮贯通 + citations 错位): 与 chat() 同一 ChatContextAssembler —
         // history block 进 context、LITM/budget 对齐 citations。SSE 发给前端的 CitationsEvent
         // 用对齐后的列表, 保证 [n] 与引用卡片一致。
         List<ChatResult.Citation> citations =
@@ -771,8 +618,8 @@ public class ChatService {
                                                 c.llmContext(),
                                                 c.sectionPath()))
                         .toList();
-        AssembledContext assembled =
-                assembleContextWithHistory(ctx, topicShift, citations, traceId.value(), lfTrace);
+        ChatContextAssembler.Result assembled =
+                chatContextAssembler.assemble(ctx, topicShift, citations, traceId.value(), lfTrace);
         List<String> context = assembled.context();
         citations = assembled.citations();
         final List<ChatResult.Citation> alignedCitations = citations;
@@ -861,7 +708,7 @@ public class ChatService {
                                             // Phase 3.A: SSE outcome 设 ok/degraded 供 doFinally
                                             // record
                                             sseOutcome.set(streamRefusal ? "degraded" : "ok");
-                                            persistTrace(
+                                            chatResultFinalizer.persistStreamTrace(
                                                     cmd,
                                                     traceId,
                                                     finalAnswer,
@@ -870,44 +717,13 @@ public class ChatService {
                                             // P0 修复(SSE 多轮贯通): OK turn 写回 history (硬 gate:
                                             // 仅 OK 且非拒答才写, 防污染 rewrite) + 触发异步压缩。
                                             if (!streamRefusal
-                                                    && streamCtx != null
-                                                    && isMultiTurnEnabled()
-                                                    && conversationId != null
-                                                    && !conversationId.isBlank()) {
-                                                try {
-                                                    List<Long> citedChunkIds =
-                                                            alignedCitations.stream()
-                                                                    .map(
-                                                                            ChatResult.Citation
-                                                                                    ::chunkId)
-                                                                    .toList();
-                                                    ConversationContext updatedCtx =
-                                                            streamCtx.appendTurn(
-                                                                    new Turn(
-                                                                            cmd.query(),
-                                                                            finalAnswer,
-                                                                            citedChunkIds,
-                                                                            StateHint.OK,
-                                                                            Instant.now()));
-                                                    conversationStore.save(updatedCtx);
-                                                    int threshold =
-                                                            conversationProperties != null
-                                                                    ? conversationProperties
-                                                                            .getCompressThreshold()
-                                                                    : 6;
-                                                    if (historyCompressor != null
-                                                            && updatedCtx.recentTurns() != null
-                                                            && updatedCtx.recentTurns().size()
-                                                                    >= threshold) {
-                                                        historyCompressor.compress(conversationId);
-                                                    }
-                                                } catch (Exception e) {
-                                                    log.warn(
-                                                            "chat.stream_history_write_failed"
-                                                                    + " conv_id={}, reason={}",
-                                                            conversationId,
-                                                            e.getMessage());
-                                                }
+                                                    && conversationContextCoordinator.isEnabled()) {
+                                                conversationHistoryWriter.recordSuccessfulTurn(
+                                                        conversationId,
+                                                        streamCtx,
+                                                        cmd.query(),
+                                                        finalAnswer,
+                                                        alignedCitations);
                                             }
                                             // 流正常结束 → 发 DoneEvent(拒答时 LLM_DEGRADED)
                                             return reactor.core.publisher.Flux.just(
@@ -940,7 +756,7 @@ public class ChatService {
                                     // Phase 3.A: SSE outcome 设 degraded 供 doFinally record total
                                     sseOutcome.set("degraded");
                                     // LLM 失败时落降级 trace + 发唯一的 DoneEvent(LLM_DEGRADED)
-                                    persistTrace(
+                                    chatResultFinalizer.persistStreamTrace(
                                             cmd,
                                             traceId,
                                             acc.toString(),
@@ -989,173 +805,6 @@ public class ChatService {
         return reactor.core.publisher.Flux.<ChatStreamEvent>just(head).concatWith(tokens);
     }
 
-    /**
-     * 异步落 chat_traces: 流结束/失败时调, 用 REQUIRES_NEW 短事务同 {@link #finish} 设计。
-     *
-     * <p>PR-1 / EMS-PR1: 同时落 Evidence 快照, 让 SSE 流出的 trace 也能由 trace_id 还原证据。
-     */
-    private void persistTrace(
-            ChatCommand cmd,
-            TraceId traceId,
-            String answer,
-            StateHint hint,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        try {
-            ChatTrace trace =
-                    new ChatTrace(
-                            traceId,
-                            sha256(cmd.query()),
-                            cmd.query().length(),
-                            answer.length(),
-                            hint,
-                            null);
-            // snapshot=null 时走单参 save (保持 mock 测试兼容); 非 null 走双参 save
-            if (evidenceSnapshot == null) {
-                chatTracesRepository.save(trace);
-            } else {
-                chatTracesRepository.save(trace, evidenceSnapshot);
-            }
-            log.info("chat.stream_end trace_id={}, state_hint={}", traceId.value(), hint);
-        } catch (Exception e) {
-            // 落库失败绝不阻塞前端流; 只 log
-            log.warn(
-                    "chat.stream_persist_failed trace_id={}, err={}",
-                    traceId.value(),
-                    e.getMessage());
-        }
-    }
-
-    /**
-     * P0 修复(citations 错位)统一组装: history block + LITM 重排 + token/char 双闸预算 + citations 对齐。
-     *
-     * <p>chat() 与 chatStream() 必须共用本方法, 保证两条主路径的 [n] 编号语义一致:
-     *
-     * <ul>
-     *   <li>history block (带 {@code <<CONVERSATION_HISTORY>>} marker) 作为 context 第 1 entry, LLM
-     *       client 渲染为不占 [n] 编号的独立段
-     *   <li>LITM 重排只作用于 evidence (history 不参与重排), 且 citations 同步重排保持配对
-     *   <li>预算截断后 kept 之外的 evidence 从返回的 citations 中移除 — LLM 只能给可见 evidence 标 [n], 前端卡片与 [n] 严格一一对应
-     * </ul>
-     */
-    private AssembledContext assembleContextWithHistory(
-            ConversationContext ctx,
-            boolean topicShift,
-            List<ChatResult.Citation> retrievedCitations,
-            String traceId,
-            String lfTrace) {
-        String historyBlock = "";
-        if (ctx != null && ctx.isEnabled() && promptAssembler != null) {
-            historyBlock = promptAssembler.buildHistoryBlock(ctx, topicShift);
-        }
-        final boolean hasHistory = historyBlock != null && !historyBlock.isBlank();
-
-        List<ChatResult.Citation> working = new ArrayList<>(retrievedCitations);
-        // Phase 2.A Upgrade A2: Lost-in-the-Middle 重排 (flag-driven, 默认 OFF=baseline 行为)
-        // 论文 Liu et al. 2023: LLM 在长 context 中对 [中间位置] 信息提取能力下降。
-        // citations 与 context 必须同步重排, 否则开启 LITM 时 [n] 与前端卡片错位。
-        if (chatMessages != null && chatMessages.isLitmReorder() && working.size() > 2) {
-            working = applyLitmReorderCitations(working);
-        }
-
-        List<String> context = new ArrayList<>();
-        if (hasHistory) {
-            context.add(historyBlock.trim());
-        }
-        for (var c : working) {
-            context.add(c.llmContext());
-        }
-        context = applyContextBudget(context, traceId, lfTrace);
-
-        int keptEntries = context.size();
-        int keptEvidence = hasHistory ? Math.max(0, keptEntries - 1) : keptEntries;
-        List<ChatResult.Citation> aligned =
-                List.copyOf(working.subList(0, Math.min(keptEvidence, working.size())));
-        if (aligned.size() < working.size()) {
-            log.info(
-                    "chat.citations_aligned_to_budget trace_id={}, kept={}/{}",
-                    traceId,
-                    aligned.size(),
-                    working.size());
-        }
-        return new AssembledContext(List.copyOf(context), aligned);
-    }
-
-    /** {@link #assembleContextWithHistory} 的结果: 对齐后的 context 与 citations。 */
-    private record AssembledContext(List<String> context, List<ChatResult.Citation> citations) {}
-
-    /**
-     * Phase 2.A Upgrade A2: Lost-in-the-Middle 重排的 citations 配对版本。
-     *
-     * <p>与 {@link #applyLostInTheMiddleReorder(List)} 同一排列算法, 但作用于 citation 列表 — llmContext 与
-     * citation 同源同序, 排 citation 即排 context。
-     */
-    static List<ChatResult.Citation> applyLitmReorderCitations(
-            List<ChatResult.Citation> sortedDesc) {
-        if (sortedDesc == null || sortedDesc.size() <= 2) {
-            return sortedDesc;
-        }
-        int n = sortedDesc.size();
-        List<ChatResult.Citation> out = new ArrayList<>(n);
-        out.add(sortedDesc.get(0)); // 头: 最高分
-        java.util.ArrayDeque<ChatResult.Citation> mid = new java.util.ArrayDeque<>();
-        for (int i = 2; i < n; i++) {
-            if ((i & 1) == 0) {
-                mid.addFirst(sortedDesc.get(i)); // i=2,4,...靠头侧
-            } else {
-                mid.addLast(sortedDesc.get(i)); // i=3,5,...靠尾侧
-            }
-        }
-        out.addAll(mid);
-        out.add(sortedDesc.get(1)); // 尾: 次高分
-        return out;
-    }
-
-    private List<String> applyContextBudget(List<String> context, String traceId, String lfTrace) {
-        int budget =
-                onlineExecutionProperties == null
-                        ? 3000
-                        : onlineExecutionProperties.getContextTokenBudget();
-        com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder builder =
-                tokenBudgetContextBuilder == null
-                        ? new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder()
-                        : tokenBudgetContextBuilder;
-        com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder.BuildResult built =
-                builder.build(
-                        context,
-                        budget,
-                        onlineExecutionProperties == null
-                                ? 3800
-                                : onlineExecutionProperties.getContextMaxChars());
-        traceObserver.observe(
-                lfTrace,
-                TraceObserver.ObservationType.DECISION,
-                "context.token_budget",
-                null,
-                Map.of(
-                        "estimated_tokens",
-                        built.estimatedTokens(),
-                        "token_budget",
-                        built.tokenBudget(),
-                        "truncated",
-                        built.truncated(),
-                        "reason_code",
-                        built.truncated()
-                                ? com.xxx.ragdoc.application.chat.router.OnlineReasonCode
-                                        .CONTEXT_TOKEN_BUDGET_APPLIED
-                                        .name()
-                                : "CONTEXT_WITHIN_BUDGET"),
-                0,
-                null);
-        if (built.truncated()) {
-            log.info(
-                    "chat.context_truncated trace_id={}, estimated_tokens={}, budget={}",
-                    traceId,
-                    built.estimatedTokens(),
-                    built.tokenBudget());
-        }
-        return built.context();
-    }
-
     private static String reasonCodeFor(StateHint hint) {
         return switch (hint) {
             case OK -> "ANSWER_OK";
@@ -1173,116 +822,6 @@ public class ChatService {
         };
     }
 
-    /** 共用收尾: 写 chat_traces + 拼 ChatResult.citations, 同事务保证 feedback 软引用合法性根基。 */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations) {
-        return finish(cmd, traceId, hint, answer, citations, null, null);
-    }
-
-    /** Task 7: 重载收尾, 含 verification 透传给 ChatResult. */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        return finish(cmd, traceId, hint, answer, citations, verification, null);
-    }
-
-    /**
-     * PR-1 / EMS-PR1: 完整收尾 — 同时落 trace 与真实 Evidence 快照。
-     *
-     * @param verification Task 7 引用核验结果; nullable
-     * @param evidenceSnapshot 本次 chat 实际使用的 Evidence 三段快照; null = NO_RECALL/EMPTY_KB/未启用
-     */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        ChatTrace trace =
-                new ChatTrace(
-                        traceId,
-                        sha256(cmd.query()),
-                        cmd.query().length(),
-                        answer.length(),
-                        hint,
-                        null);
-        // snapshot=null 时走单参 save — 保持与既有 ChatServiceTest/ConversationStore mock 的兼容
-        // (那些测试已 stub save(ChatTrace), 走双参 default delegator 会让 verify 失败)。
-        if (evidenceSnapshot == null) {
-            chatTracesRepository.save(trace);
-        } else {
-            chatTracesRepository.save(trace, evidenceSnapshot);
-        }
-        log.info("chat.end trace_id={}, state_hint={}", traceId.value(), hint);
-        return new ChatResult(answer, citations, hint, traceId, verification, evidenceSnapshot);
-    }
-
-    /**
-     * Phase 3.A: finish + 上调 chat_total_latency metric。
-     *
-     * <p>outcome tag 规则:
-     *
-     * <ul>
-     *   <li>OK → "ok"
-     *   <li>NO_RECALL / EMPTY_KB → "skipped"(不进 LLM, 不算 LLM 失败)
-     *   <li>LLM_DEGRADED → "degraded"
-     * </ul>
-     */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat) {
-        return finishAndRecord(cmd, traceId, hint, answer, citations, t0Chat, null);
-    }
-
-    /** Task 7: 重载接受 verification 结果随 response 透传。 */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        return finishAndRecord(cmd, traceId, hint, answer, citations, t0Chat, verification, null);
-    }
-
-    /** PR-1 / EMS-PR1: 增加 evidenceSnapshot 透传 — 让 trace + evidence 一同落库, 可由 trace_id 还原。 */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        ChatResult r =
-                finish(cmd, traceId, hint, answer, citations, verification, evidenceSnapshot);
-        String outcome =
-                switch (hint) {
-                    case OK -> "ok";
-                    case NO_RECALL, EMPTY_KB -> "skipped";
-                    case REFUSED -> "refused";
-                    case LLM_DEGRADED, VERIFY_FAILED -> "degraded";
-                };
-        metrics.recordChatTotal(System.currentTimeMillis() - t0Chat, outcome);
-        return r;
-    }
-
     /**
      * Phase 1 / C7 G3 修复 (2026-08-04 实跑发现): 检测 LLM 真返回的"无相关内容"拒答文案。
      *
@@ -1294,91 +833,6 @@ public class ChatService {
      *
      * <p>False positive 风险: 真正常回答 ≤20 字 + 含这些 marker 极少 (length gate 守门)。
      */
-    // ─── Task 7 / V13 Citation Verification helpers ───────────────────
-
-    /**
-     * 运行 citation 验证; 返 null 表示未启用 (properties disabled 或 verifier bean 未注入)。
-     *
-     * <p>语义: WARN_ONLY 时 FAIL 也返 VerificationResult.outcome=FAIL, errorMessage 标 "WARN_ONLY: ..." 让
-     * caller 据此不改 hint; REFUSE/REGENERATE (耗尽) 时 outcome=FAIL + 无 WARN_ONLY 前缀。
-     *
-     * <p>REGENERATE 暂不真调 LLM 二次 (避免影响 streaming / token accounting 路径), 当作 REFUSE 处理 (javadoc 标注 +
-     * properties field 保留以便 Phase 3.B 接入)。
-     */
-    private com.xxx.ragdoc.application.chat.verification.VerificationResult runCitationVerification(
-            String answer, java.util.List<ChatResult.Citation> citations) {
-        if (citationVerifier == null
-                || citationVerifierProperties == null
-                || !citationVerifierProperties.isEnabled()) {
-            return null;
-        }
-        if (answer == null || citations == null || citations.isEmpty()) {
-            return null;
-        }
-        // 把 citations 转成 evidence list (用 llmContext 优先, fallback snippet)
-        java.util.List<
-                        com.xxx.ragdoc.application.chat.verification.port.CitationVerifierPort
-                                .Evidence>
-                evidences =
-                        citations.stream()
-                                .map(
-                                        c ->
-                                                new com.xxx.ragdoc.application.chat.verification
-                                                        .port.CitationVerifierPort.Evidence(
-                                                        c.chunkId() == null ? 0L : c.chunkId(),
-                                                        c.llmContext() == null
-                                                                ? c.snippet()
-                                                                : c.llmContext()))
-                                .toList();
-        com.xxx.ragdoc.application.chat.verification.VerificationResult r =
-                citationVerifier.verify(answer, evidences);
-        if (r.outcome()
-                        == com.xxx.ragdoc.application.chat.verification.VerificationResult.Outcome
-                                .FAIL
-                && citationVerifierProperties.getOnFail()
-                        == com.xxx.ragdoc.application.chat.CitationVerifierProperties.OnFail
-                                .WARN_ONLY) {
-            // WARN_ONLY: caller 据 errorMessage 不改 hint
-            return new com.xxx.ragdoc.application.chat.verification.VerificationResult(
-                    r.outcome(),
-                    r.overallScore(),
-                    r.citationScores(),
-                    "WARN_ONLY:fail_score=" + r.overallScore());
-        }
-        return r;
-    }
-
-    /** Task 7: 把 NLI scores 写回每条 citation.verifyScore (无对应 chunkId 的citation留 null)。 */
-    private static java.util.List<ChatResult.Citation> annotateCitationScores(
-            java.util.List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        if (citations == null || citations.isEmpty()) return citations;
-        if (verification == null
-                || verification.citationScores() == null
-                || verification.citationScores().isEmpty()) {
-            return citations;
-        }
-        java.util.Map<Long, Double> scoreByChunkId = new java.util.HashMap<>();
-        for (var s : verification.citationScores()) {
-            scoreByChunkId.put(s.chunkId(), s.score());
-        }
-        return citations.stream()
-                .map(
-                        c -> {
-                            Double s = c.chunkId() == null ? null : scoreByChunkId.get(c.chunkId());
-                            if (s == null) return c;
-                            return new ChatResult.Citation(
-                                    c.chunkId(),
-                                    c.docId(),
-                                    c.page(),
-                                    c.snippet(),
-                                    c.llmContext(),
-                                    c.sectionPath(),
-                                    s);
-                        })
-                .toList();
-    }
-
     // ─── Task 9 / V15 Langfuse trace enrichment helpers ──────────────
 
     /**
@@ -1407,21 +861,6 @@ public class ChatService {
                 || trimmed.contains("未在知识库中找到")
                 || trimmed.equals("无相关信息")
                 || trimmed.equals("(无答案)");
-    }
-
-    /** SHA-256 hex 计算; 防 PII 沉淀, 仅存 hash 不存原 query。 */
-    private static String sha256(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(64);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 不可用", e);
-        }
     }
 
     /**

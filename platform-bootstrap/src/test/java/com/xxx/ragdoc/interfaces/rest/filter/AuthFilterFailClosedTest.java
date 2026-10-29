@@ -5,9 +5,8 @@ import static org.mockito.Mockito.*;
 
 import com.xxx.ragdoc.application.auth.AuthContext;
 import com.xxx.ragdoc.application.auth.AuthProperties;
+import com.xxx.ragdoc.application.auth.AuthenticationPort;
 import com.xxx.ragdoc.domain.auth.Principal;
-import com.xxx.ragdoc.infrastructure.persistence.jpa.entity.PrincipalEntity;
-import com.xxx.ragdoc.infrastructure.persistence.jpa.repository.PrincipalJpaRepository;
 import jakarta.servlet.FilterChain;
 import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
@@ -21,7 +20,7 @@ import org.springframework.mock.web.MockHttpServletResponse;
 /**
  * Task 11 P0: {@link AuthFilter} fail-closed 单元验证。
  *
- * <p>覆盖任务文档 §6.1 全部场景 (mock PrincipalJpaRepository, 不调真 DB):
+ * <p>覆盖任务文档 §6.1 全部场景 (mock AuthenticationPort, 不调真 DB):
  *
  * <ul>
  *   <li>无 token → 401, 不调 Controller
@@ -38,21 +37,17 @@ import org.springframework.mock.web.MockHttpServletResponse;
 @DisplayName("Task 11 P0 AuthFilter fail-closed")
 class AuthFilterFailClosedTest {
 
-    private PrincipalJpaRepository repo;
+    private AuthenticationPort authenticationPort;
     private AuthProperties props;
     private AuthFilter filter;
     private FilterChain chain;
 
     @BeforeEach
     void setup() {
-        repo = mock(PrincipalJpaRepository.class);
+        authenticationPort = mock(AuthenticationPort.class);
         props = new AuthProperties(mock(org.springframework.core.env.Environment.class));
         props.setDevDefaultPrincipalEnabled(false); // 默认关闭, 测 deny-default
-        @SuppressWarnings("unchecked")
-        org.springframework.beans.factory.ObjectProvider<PrincipalJpaRepository> provider =
-                mock(org.springframework.beans.factory.ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(repo);
-        filter = new AuthFilter(provider, props);
+        filter = new AuthFilter(authenticationPort, props);
         chain = mock(FilterChain.class);
     }
 
@@ -83,7 +78,7 @@ class AuthFilterFailClosedTest {
     @Test
     @DisplayName("未知 token → 401, 不调 Controller")
     void unknownTokenBlocks() throws Exception {
-        when(repo.findByToken("ghost-token")).thenReturn(Optional.empty());
+        when(authenticationPort.authenticate("ghost-token")).thenReturn(Optional.empty());
         MockHttpServletResponse resp = new MockHttpServletResponse();
         filter.doFilter(req("/api/v1/chat", "Bearer ghost-token"), resp, chain);
         assertThat(status(resp)).isEqualTo(401);
@@ -102,12 +97,13 @@ class AuthFilterFailClosedTest {
     @Test
     @DisplayName("有效 token → 进入 Controller + AuthContext 写入真实 Principal")
     void validTokenPasses() throws Exception {
-        PrincipalEntity entity = new PrincipalEntity();
-        entity.setTenantId("tenantA");
-        entity.setUserId("userA");
-        entity.setRoles("role:default,role:user");
-        entity.setToken("good-token");
-        when(repo.findByToken("good-token")).thenReturn(Optional.of(entity));
+        Principal principal =
+                new Principal(
+                        "tenantA",
+                        "userA",
+                        java.util.Set.of("role:default", "role:user"),
+                        "good-token");
+        when(authenticationPort.authenticate("good-token")).thenReturn(Optional.of(principal));
 
         MockHttpServletResponse resp = new MockHttpServletResponse();
         filter.doFilter(req("/api/v1/chat", "Bearer good-token"), resp, chain);
@@ -131,7 +127,8 @@ class AuthFilterFailClosedTest {
     @Test
     @DisplayName("DB 异常 → 500 (不 fallback 默认主体)")
     void dbExceptionReturns500NotFallback() throws Exception {
-        when(repo.findByToken("any-token")).thenThrow(new RuntimeException("MySQL down"));
+        when(authenticationPort.authenticate("any-token"))
+                .thenThrow(new RuntimeException("MySQL down"));
         MockHttpServletResponse resp = new MockHttpServletResponse();
         filter.doFilter(req("/api/v1/chat", "Bearer any-token"), resp, chain);
         assertThat(status(resp)).isEqualTo(500);
@@ -172,12 +169,8 @@ class AuthFilterFailClosedTest {
     @Test
     @DisplayName("请求结束 (无论成功/失败) 后 AuthContext 被清回 DEFAULT (防旧 principal 串号)")
     void authContextClearedAfterRequest() throws Exception {
-        PrincipalEntity entity = new PrincipalEntity();
-        entity.setTenantId("t1");
-        entity.setUserId("u1");
-        entity.setRoles("role:default");
-        entity.setToken("t");
-        when(repo.findByToken("t")).thenReturn(Optional.of(entity));
+        Principal principal = new Principal("t1", "u1", java.util.Set.of("role:default"), "t");
+        when(authenticationPort.authenticate("t")).thenReturn(Optional.of(principal));
 
         MockHttpServletResponse resp = new MockHttpServletResponse();
         filter.doFilter(req("/api/v1/chat", "Bearer t"), resp, chain);
@@ -194,19 +187,11 @@ class AuthFilterFailClosedTest {
         @Test
         @DisplayName("两线程并发不同 token → 各自 AuthContext 独立, 不串号")
         void threadLocalNoBleed() throws Exception {
-            PrincipalEntity a = new PrincipalEntity();
-            a.setUserId("userA");
-            a.setTenantId("tA");
-            a.setRoles("role:default");
-            a.setToken("tokA");
-            PrincipalEntity b = new PrincipalEntity();
-            b.setUserId("userB");
-            b.setTenantId("tB");
-            b.setRoles("role:default");
-            b.setToken("tokB");
+            Principal a = new Principal("tA", "userA", java.util.Set.of("role:default"), "tokA");
+            Principal b = new Principal("tB", "userB", java.util.Set.of("role:default"), "tokB");
 
-            when(repo.findByToken("tokA")).thenReturn(Optional.of(a));
-            when(repo.findByToken("tokB")).thenReturn(Optional.of(b));
+            when(authenticationPort.authenticate("tokA")).thenReturn(Optional.of(a));
+            when(authenticationPort.authenticate("tokB")).thenReturn(Optional.of(b));
 
             java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(2);
             java.util.List<String> errors =

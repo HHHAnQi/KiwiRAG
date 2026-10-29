@@ -18,9 +18,8 @@ import org.springframework.stereotype.Component;
  * <p>覆盖 DoD-1: parser 进程死, 重启后该 job 周期性扫, 把 zombie RUNNING 还回 PENDING → 下轮 worker pull 重启继续解析。续点字段
  * chunks_written / chunk_seq_offset 在 worker 重启后从该值继续(spec §3.1).
  *
- * <p>DoD-2 重试队列: FAILED → PENDING 的回 rebalance 不是本 job 责任, 失败时 markFailed 已经把 visibleAt push +60s(见
- * ParseTaskService.markFailed); 本 job 第二轮发现 PENDING 状态时, 由 ParseTaskConsumer 拿到 RocketMQ 原始 message
- * 重投 OR 通过心跳找到 PENDING 重发 MQ(后续 V3.5 加重生投 job).
+ * <p>本 job 在同一次仓储更新中同时重置 execution 与 delivery 状态；chat-app 中的 {@code ParseTaskOutboxRelay} 会扫描恢复为
+ * PENDING 的投递记录并重发 MQ。因此 worker crash 恢复不依赖原始 RocketMQ message 再投，也不需要人工 retry API。
  */
 @Slf4j
 @Component

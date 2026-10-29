@@ -43,7 +43,7 @@ test: ## 单元测试
 	$(GRADLE) test
 
 test-integration: ## 集成测试(Testcontainers 自动起容器)
-	$(GRADLE) test
+	$(GRADLE) integrationTest
 
 lint: ## Spotless 格式检查
 	$(GRADLE) spotlessCheck

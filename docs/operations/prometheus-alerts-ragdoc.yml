@@ -56,9 +56,9 @@ groups:
       # 4. Retrieve zero_recall 比例 > 20% (有 READY 文档但召回空)
       - alert: RagdocRetrieveZeroRecallHigh
         expr: |
-          sum(rate(ragdoc_retrieve_recall_count_count{quantile="0" or le="0"}[5m]))
+          sum(rate(ragdoc_retrieve_requests_total{outcome="zero"}[5m]))
           /
-          clamp_min(sum(rate(ragdoc_retrieve_recall_count_count[5m])), 0.001)
+          clamp_min(sum(rate(ragdoc_retrieve_requests_total[5m])), 0.001)
           > 0.20
         for: 10m
         labels:
@@ -148,4 +148,3 @@ groups:
     annotations:
       summary: "RagDoc compression 调用为 0 但 chat 在跑"
       description: "ADR-0011 §6: chat 有流量 (≥0.1/s) 但 15min 内 compress 调用为 0。可能 historyCompressor Bean 未注入 (compress flag 未开) 或 conversationStore 故障 — 第 1 个 turn 之后的 ctx 都 fail save 后就没法触发 compress。"
-

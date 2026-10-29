@@ -36,6 +36,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.test.util.ReflectionTestUtils;
 
 /**
  * ChatService 单元测试(V2-B 升级版)。
@@ -78,6 +79,13 @@ class ChatServiceTest {
 
     @BeforeEach
     void setupMessages() {
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatResultFinalizer",
+                new ChatResultFinalizer(chatTracesRepository, metrics));
+        ConversationHistoryWriter historyWriter = new ConversationHistoryWriter();
+        historyWriter.setStore(conversationStore);
+        ReflectionTestUtils.setField(chatService, "conversationHistoryWriter", historyWriter);
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");
@@ -85,9 +93,23 @@ class ChatServiceTest {
         when(retrieveService.retrieve(any())).thenReturn(RetrieveService.RetrieveResult.empty());
         // traceObserver.startTrace 默认返回原 traceId 让内部链路对齐
         lenient().when(traceObserver.startTrace(any(), any(), any())).thenReturn(TID.value());
-        // Phase 1 / C4: @InjectMocks 对 setter 注入 @Autowired(required=false) 不一定可靠,
-        // 显式手动调 setter 强制注入 mock (mock 都是 @Mock 创建, 非 null, isMultiTurnEnabled() 应 true)
-        chatService.setConversationDeps(conversationStore, queryContextualizer, promptAssembler);
+        ConversationContextCoordinator contextCoordinator = new ConversationContextCoordinator();
+        contextCoordinator.setCoreDependencies(
+                conversationStore, queryContextualizer, promptAssembler);
+        ReflectionTestUtils.setField(
+                chatService, "conversationContextCoordinator", contextCoordinator);
+        ReflectionTestUtils.setField(
+                chatService, "chatContextAssembler", testContextAssembler(contextCoordinator));
+    }
+
+    private ChatContextAssembler testContextAssembler(
+            ConversationContextCoordinator contextCoordinator) {
+        return new ChatContextAssembler(
+                contextCoordinator,
+                chatMessages,
+                new com.xxx.ragdoc.application.chat.pipeline.TokenBudgetContextBuilder(),
+                new com.xxx.ragdoc.application.chat.pipeline.OnlineExecutionProperties(),
+                traceObserver);
     }
 
     @Nested

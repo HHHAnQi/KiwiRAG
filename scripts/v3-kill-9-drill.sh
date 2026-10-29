@@ -192,15 +192,19 @@ for i in $(seq 1 20); do
   if [ "$STATUS_AFTER_REAP" = "PENDING" ] || [ "$STATUS_AFTER_REAP" = "PARSED" ]; then break; fi
   sleep 2
 done
-assert '[ "$STATUS_AFTER_REAP" = "PENDING" ]' "心跳 job 把 zombie RUNNING 回滚到 PENDING (新 parser 实例 reaper)"
+case "$STATUS_AFTER_REAP" in
+  PENDING|RUNNING|PARSED)
+    log "  ✓ reaper 已回收; 当前 status=$STATUS_AFTER_REAP (可能已被 outbox relay 立即重投)"
+    ;;
+  *)
+    fail "zombie RUNNING 未被回收, 实际 status=$STATUS_AFTER_REAP"
+    ;;
+esac
 
-# heartbeat 把 zombie 还 PENDING 后, RocketMQ CP 模式下旧 message 已被 ack(初次 onMessage 中途抛
-# 已被 broker 视为重投但 maxReconsumeTimes 有限, 不保证新一轮投递)。当前 V3 重投 rebalance job 仍未实现
-# (spec §3.3 注: V3.5 加)。本演练直接通过 chat-app 的 retry endpoint 重发 MQ message 触发新消费,
-# 让 new parser 把 task 重新跑完到 PARSED。这等价于未来的自动重投 job, 不影响 DoD-1/4 目标验证。
-TRIGGER_RESP=$(curl -sf -X POST "${CHAT_URL}/api/v1/documents/${DOC_ID}/retry" \
-  -H "Authorization: Bearer $AUTH_TOKEN" 2>/dev/null) || TRIGGER_RESP="(retry endpoint 失败, 走 RocketMQ native redelivery 兜底)"
-log "  trigger retry: $TRIGGER_RESP"
+# reaper 会在同一个原子 UPDATE 中把 execution 和 delivery 状态都重置为 PENDING。
+# chat-app 中的 ParseTaskOutboxRelay 随后自动重投 MQ。此处故意不调人工 retry API：
+# 只有不借助人工介入恢复到 PARSED，才能证明 worker crash 自动恢复闭环。
+log "  等待 outbox relay 自动重投（未调用人工 retry endpoint）"
 
 # 等最终 PARSED (最多 5 min, 因单文档 < 3min, 留余量; reaper 把 task 还 PENDING 后 consumer 立即重消费)
 for i in $(seq 1 150); do

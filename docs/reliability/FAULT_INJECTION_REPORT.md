@@ -4,6 +4,11 @@
 > · chat-app `RAG_PARSER_MODE=async`(:8092) + parser-service(:8093, kill后按脚本重启)
 > · git `554de74`+（含本报告所述两处修复）· 全部证据为**真实进程注入**，非单测替代。
 
+> 证据边界：下表是 2026-08-29 当时的演练记录。当时脚本包含人工 retry API，
+> 因此只能证明“可恢复”，不能单独证明“无人工介入自动恢复”。当前分支已将演练改为
+> `reaper -> outbox relay -> MQ -> parser` 全自动闭环；在新环境重跑并归档 PASS 日志前，
+> 不宣称该闭环已被实环重新验证。
+
 ## 前置修复（本轮实测暴露的两个回归）
 
 1. **parser-service 启动回归**：fat jar 内含 platform-bootstrap-plain，`RerankHealthIndicator`
