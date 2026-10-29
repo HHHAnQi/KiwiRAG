@@ -30,6 +30,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
@@ -78,6 +79,10 @@ class ChatServiceStreamTerminalStateTest {
 
     @BeforeEach
     void setup() {
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatResultFinalizer",
+                new ChatResultFinalizer(chatTracesRepository, metrics));
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");

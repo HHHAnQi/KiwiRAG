@@ -36,6 +36,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
+import org.springframework.test.util.ReflectionTestUtils;
 
 /**
  * ChatService 单元测试(V2-B 升级版)。
@@ -78,6 +79,10 @@ class ChatServiceTest {
 
     @BeforeEach
     void setupMessages() {
+        ReflectionTestUtils.setField(
+                chatService,
+                "chatResultFinalizer",
+                new ChatResultFinalizer(chatTracesRepository, metrics));
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");

@@ -12,21 +12,17 @@ import com.xxx.ragdoc.application.chat.conversation.port.PromptAssemblerPort;
 import com.xxx.ragdoc.application.chat.conversation.port.QueryContextualizerPort;
 import com.xxx.ragdoc.application.chat.conversation.port.TopicShiftDetectorPort;
 import com.xxx.ragdoc.application.chat.port.ChatClient;
-import com.xxx.ragdoc.application.chat.port.ChatTracesRepository;
 import com.xxx.ragdoc.application.chat.port.TraceObserver;
 import com.xxx.ragdoc.application.document.port.DocumentRepository;
 import com.xxx.ragdoc.common.exception.DomainException;
 import com.xxx.ragdoc.common.exception.ErrorCode;
 import com.xxx.ragdoc.common.exception.NotFoundException;
-import com.xxx.ragdoc.domain.chat.ChatTrace;
 import com.xxx.ragdoc.domain.document.Document;
 import com.xxx.ragdoc.domain.document.DocumentStatus;
 import com.xxx.ragdoc.domain.shared.StateHint;
 import com.xxx.ragdoc.domain.shared.TraceId;
 // 架构债清理: 移除 infrastructure.conversation.* 直依赖, 改用 application 层端口 + ChatService 同包的
 // ConversationProperties
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -60,7 +56,6 @@ import org.springframework.transaction.annotation.Transactional;
 public class ChatService {
 
     private final DocumentRepository documentRepository;
-    private final ChatTracesRepository chatTracesRepository;
     private final ChatMessages chatMessages;
     // V2-B 新增
     private final RetrieveService retrieveService;
@@ -120,6 +115,8 @@ public class ChatService {
     }
 
     @Autowired private CitationVerificationCoordinator citationVerificationCoordinator;
+
+    @Autowired private ChatResultFinalizer chatResultFinalizer;
 
     /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
     @org.springframework.beans.factory.annotation.Autowired
@@ -413,7 +410,7 @@ public class ChatService {
                                     hint.name(),
                                     "chat_latency_ms",
                                     System.currentTimeMillis() - t0Chat));
-                    return finishAndRecord(
+                    return chatResultFinalizer.finishAndRecord(
                             cmd,
                             traceId,
                             hint,
@@ -562,7 +559,7 @@ public class ChatService {
                         reasonCodeFor(hint),
                         "chat_latency_ms",
                         System.currentTimeMillis() - t0Chat));
-        return finishAndRecord(
+        return chatResultFinalizer.finishAndRecord(
                 cmd, traceId, hint, answer, citations, t0Chat, verification, evidenceForTrace);
     }
 
@@ -828,7 +825,7 @@ public class ChatService {
                                             // Phase 3.A: SSE outcome 设 ok/degraded 供 doFinally
                                             // record
                                             sseOutcome.set(streamRefusal ? "degraded" : "ok");
-                                            persistTrace(
+                                            chatResultFinalizer.persistStreamTrace(
                                                     cmd,
                                                     traceId,
                                                     finalAnswer,
@@ -907,7 +904,7 @@ public class ChatService {
                                     // Phase 3.A: SSE outcome 设 degraded 供 doFinally record total
                                     sseOutcome.set("degraded");
                                     // LLM 失败时落降级 trace + 发唯一的 DoneEvent(LLM_DEGRADED)
-                                    persistTrace(
+                                    chatResultFinalizer.persistStreamTrace(
                                             cmd,
                                             traceId,
                                             acc.toString(),
@@ -954,42 +951,6 @@ public class ChatService {
 
         // 异常路径也要落 trace(LLM_DEGRADED 时 acc 包含部分答案; onErrorResume 已转 DoneEvent)
         return reactor.core.publisher.Flux.<ChatStreamEvent>just(head).concatWith(tokens);
-    }
-
-    /**
-     * 异步落 chat_traces: 流结束/失败时调, 用 REQUIRES_NEW 短事务同 {@link #finish} 设计。
-     *
-     * <p>PR-1 / EMS-PR1: 同时落 Evidence 快照, 让 SSE 流出的 trace 也能由 trace_id 还原证据。
-     */
-    private void persistTrace(
-            ChatCommand cmd,
-            TraceId traceId,
-            String answer,
-            StateHint hint,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        try {
-            ChatTrace trace =
-                    new ChatTrace(
-                            traceId,
-                            sha256(cmd.query()),
-                            cmd.query().length(),
-                            answer.length(),
-                            hint,
-                            null);
-            // snapshot=null 时走单参 save (保持 mock 测试兼容); 非 null 走双参 save
-            if (evidenceSnapshot == null) {
-                chatTracesRepository.save(trace);
-            } else {
-                chatTracesRepository.save(trace, evidenceSnapshot);
-            }
-            log.info("chat.stream_end trace_id={}, state_hint={}", traceId.value(), hint);
-        } catch (Exception e) {
-            // 落库失败绝不阻塞前端流; 只 log
-            log.warn(
-                    "chat.stream_persist_failed trace_id={}, err={}",
-                    traceId.value(),
-                    e.getMessage());
-        }
     }
 
     /**
@@ -1140,116 +1101,6 @@ public class ChatService {
         };
     }
 
-    /** 共用收尾: 写 chat_traces + 拼 ChatResult.citations, 同事务保证 feedback 软引用合法性根基。 */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations) {
-        return finish(cmd, traceId, hint, answer, citations, null, null);
-    }
-
-    /** Task 7: 重载收尾, 含 verification 透传给 ChatResult. */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        return finish(cmd, traceId, hint, answer, citations, verification, null);
-    }
-
-    /**
-     * PR-1 / EMS-PR1: 完整收尾 — 同时落 trace 与真实 Evidence 快照。
-     *
-     * @param verification Task 7 引用核验结果; nullable
-     * @param evidenceSnapshot 本次 chat 实际使用的 Evidence 三段快照; null = NO_RECALL/EMPTY_KB/未启用
-     */
-    private ChatResult finish(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        ChatTrace trace =
-                new ChatTrace(
-                        traceId,
-                        sha256(cmd.query()),
-                        cmd.query().length(),
-                        answer.length(),
-                        hint,
-                        null);
-        // snapshot=null 时走单参 save — 保持与既有 ChatServiceTest/ConversationStore mock 的兼容
-        // (那些测试已 stub save(ChatTrace), 走双参 default delegator 会让 verify 失败)。
-        if (evidenceSnapshot == null) {
-            chatTracesRepository.save(trace);
-        } else {
-            chatTracesRepository.save(trace, evidenceSnapshot);
-        }
-        log.info("chat.end trace_id={}, state_hint={}", traceId.value(), hint);
-        return new ChatResult(answer, citations, hint, traceId, verification, evidenceSnapshot);
-    }
-
-    /**
-     * Phase 3.A: finish + 上调 chat_total_latency metric。
-     *
-     * <p>outcome tag 规则:
-     *
-     * <ul>
-     *   <li>OK → "ok"
-     *   <li>NO_RECALL / EMPTY_KB → "skipped"(不进 LLM, 不算 LLM 失败)
-     *   <li>LLM_DEGRADED → "degraded"
-     * </ul>
-     */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat) {
-        return finishAndRecord(cmd, traceId, hint, answer, citations, t0Chat, null);
-    }
-
-    /** Task 7: 重载接受 verification 结果随 response 透传。 */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification) {
-        return finishAndRecord(cmd, traceId, hint, answer, citations, t0Chat, verification, null);
-    }
-
-    /** PR-1 / EMS-PR1: 增加 evidenceSnapshot 透传 — 让 trace + evidence 一同落库, 可由 trace_id 还原。 */
-    private ChatResult finishAndRecord(
-            ChatCommand cmd,
-            TraceId traceId,
-            StateHint hint,
-            String answer,
-            List<ChatResult.Citation> citations,
-            long t0Chat,
-            com.xxx.ragdoc.application.chat.verification.VerificationResult verification,
-            com.xxx.ragdoc.application.chat.evidence.EvidenceSnapshot evidenceSnapshot) {
-        ChatResult r =
-                finish(cmd, traceId, hint, answer, citations, verification, evidenceSnapshot);
-        String outcome =
-                switch (hint) {
-                    case OK -> "ok";
-                    case NO_RECALL, EMPTY_KB -> "skipped";
-                    case REFUSED -> "refused";
-                    case LLM_DEGRADED, VERIFY_FAILED -> "degraded";
-                };
-        metrics.recordChatTotal(System.currentTimeMillis() - t0Chat, outcome);
-        return r;
-    }
-
     /**
      * Phase 1 / C7 G3 修复 (2026-08-04 实跑发现): 检测 LLM 真返回的"无相关内容"拒答文案。
      *
@@ -1289,21 +1140,6 @@ public class ChatService {
                 || trimmed.contains("未在知识库中找到")
                 || trimmed.equals("无相关信息")
                 || trimmed.equals("(无答案)");
-    }
-
-    /** SHA-256 hex 计算; 防 PII 沉淀, 仅存 hash 不存原 query。 */
-    private static String sha256(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(64);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 不可用", e);
-        }
     }
 
     /**
