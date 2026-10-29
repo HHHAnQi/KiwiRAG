@@ -83,6 +83,9 @@ class ChatServiceTest {
                 chatService,
                 "chatResultFinalizer",
                 new ChatResultFinalizer(chatTracesRepository, metrics));
+        ConversationHistoryWriter historyWriter = new ConversationHistoryWriter();
+        historyWriter.setStore(conversationStore);
+        ReflectionTestUtils.setField(chatService, "conversationHistoryWriter", historyWriter);
         when(chatMessages.getEmptyKbMessage()).thenReturn("EMPTY_MSG");
         when(chatMessages.getNoRecallMessage()).thenReturn("NORECALL_MSG");
         when(chatMessages.getLlmDegradedMessage()).thenReturn("LLM_FAIL:");

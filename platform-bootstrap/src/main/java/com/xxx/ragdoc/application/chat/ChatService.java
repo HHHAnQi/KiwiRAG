@@ -5,9 +5,7 @@ import com.xxx.ragdoc.application.chat.command.ChatResult;
 import com.xxx.ragdoc.application.chat.command.ChatStreamEvent;
 import com.xxx.ragdoc.application.chat.conversation.ContextualizeResult;
 import com.xxx.ragdoc.application.chat.conversation.ConversationContext;
-import com.xxx.ragdoc.application.chat.conversation.ConversationContext.Turn;
 import com.xxx.ragdoc.application.chat.conversation.port.ConversationStore;
-import com.xxx.ragdoc.application.chat.conversation.port.HistoryCompressorPort;
 import com.xxx.ragdoc.application.chat.conversation.port.PromptAssemblerPort;
 import com.xxx.ragdoc.application.chat.conversation.port.QueryContextualizerPort;
 import com.xxx.ragdoc.application.chat.conversation.port.TopicShiftDetectorPort;
@@ -23,7 +21,6 @@ import com.xxx.ragdoc.domain.shared.StateHint;
 import com.xxx.ragdoc.domain.shared.TraceId;
 // 架构债清理: 移除 infrastructure.conversation.* 直依赖, 改用 application 层端口 + ChatService 同包的
 // ConversationProperties
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -83,9 +80,6 @@ public class ChatService {
     // Phase 1 / C5 (ADR-0011 §5): topic shift 检测器, rag.conversation.topic-shift-detect=true
     // 时注入。null 时视为永远 false (无 shift, 走正常多轮 rewrite)
     private TopicShiftDetectorPort topicShiftDetector;
-    // Phase 1 / C6 (ADR-0011 §6 §9): 异步历史压缩器, rag.conversation.compress=true 时注入。
-    // null 时不触发压缩 (buffer 大小靠 PromptAssembler MAX=5 硬 cut 单层兜底)
-    private HistoryCompressorPort historyCompressor;
 
     @Autowired(required = false)
     public void setConversationDeps(
@@ -108,15 +102,11 @@ public class ChatService {
         log.info("chat.topic_shift_detector_enabled={}", topicShiftDetector != null);
     }
 
-    @Autowired(required = false)
-    public void setHistoryCompressor(HistoryCompressorPort historyCompressor) {
-        this.historyCompressor = historyCompressor;
-        log.info("chat.history_compressor_enabled={}", historyCompressor != null);
-    }
-
     @Autowired private CitationVerificationCoordinator citationVerificationCoordinator;
 
     @Autowired private ChatResultFinalizer chatResultFinalizer;
+
+    @Autowired private ConversationHistoryWriter conversationHistoryWriter;
 
     /** 在线主链统一 Token Budget；同步和 SSE 必须调用同一个 builder。 */
     @org.springframework.beans.factory.annotation.Autowired
@@ -508,46 +498,13 @@ public class ChatService {
 
         // Phase 1 / C4 (ADR-0011 §6 + §8.2 G3): 写回 history — 仅当 OK turn 才允许 (硬 gate 防污染)
         // LLM_DEGRADED / NO_RECALL / EMPTY_KB 一律不写, 否则下游 rewrite 把"出错了"当 fact 污染指代消解
-        ConversationContext updatedCtx = null; // 用于 compress 触发判定
         if (hint == StateHint.OK
                 && ctx != null
                 && isMultiTurnEnabled()
                 && conversationId != null
                 && !conversationId.isBlank()) {
-            try {
-                List<Long> citedChunkIds =
-                        citations.stream().map(ChatResult.Citation::chunkId).toList();
-                Turn thisTurn =
-                        new Turn(cmd.query(), answer, citedChunkIds, StateHint.OK, Instant.now());
-                updatedCtx = ctx.appendTurn(thisTurn);
-                conversationStore.save(updatedCtx);
-            } catch (Exception e) {
-                // 兜底: store 异常已在 ConversationStore 内 silent log, 此处再防一道 setProperty
-                log.warn(
-                        "chat.history_write_failed conv_id={}, reason={}",
-                        conversationId,
-                        e.getMessage());
-            }
-        }
-
-        // Phase 1 / C6 (ADR-0011 §6 §9): 异步触发压缩 (fire-and-forget)
-        // 仅当: ctx 写回成功 + compress 实例注入 + 当前 buffer >= compressThreshold 才走
-        // compress 内部 needsCompression 还有双重 check (debounce 1min + size≥threshold), 防 race
-        int threshold =
-                conversationProperties != null ? conversationProperties.getCompressThreshold() : 6;
-        if (updatedCtx != null
-                && historyCompressor != null
-                && updatedCtx.recentTurns() != null
-                && updatedCtx.recentTurns().size() >= threshold) {
-            try {
-                historyCompressor.compress(conversationId);
-            } catch (Exception e) {
-                // fire-and-forget 异常不应影响 chat 返回 (DiscardPolicy 队列满也作 silent)
-                log.debug(
-                        "chat.compress_submit_skipped conv_id={}, reason={}",
-                        conversationId,
-                        e.getMessage());
-            }
+            conversationHistoryWriter.recordSuccessfulTurn(
+                    conversationId, ctx, cmd.query(), answer, citations);
         }
 
         traceObserver.endTrace(
@@ -833,45 +790,13 @@ public class ChatService {
                                                     retrieve.evidenceSnapshot());
                                             // P0 修复(SSE 多轮贯通): OK turn 写回 history (硬 gate:
                                             // 仅 OK 且非拒答才写, 防污染 rewrite) + 触发异步压缩。
-                                            if (!streamRefusal
-                                                    && streamCtx != null
-                                                    && isMultiTurnEnabled()
-                                                    && conversationId != null
-                                                    && !conversationId.isBlank()) {
-                                                try {
-                                                    List<Long> citedChunkIds =
-                                                            alignedCitations.stream()
-                                                                    .map(
-                                                                            ChatResult.Citation
-                                                                                    ::chunkId)
-                                                                    .toList();
-                                                    ConversationContext updatedCtx =
-                                                            streamCtx.appendTurn(
-                                                                    new Turn(
-                                                                            cmd.query(),
-                                                                            finalAnswer,
-                                                                            citedChunkIds,
-                                                                            StateHint.OK,
-                                                                            Instant.now()));
-                                                    conversationStore.save(updatedCtx);
-                                                    int threshold =
-                                                            conversationProperties != null
-                                                                    ? conversationProperties
-                                                                            .getCompressThreshold()
-                                                                    : 6;
-                                                    if (historyCompressor != null
-                                                            && updatedCtx.recentTurns() != null
-                                                            && updatedCtx.recentTurns().size()
-                                                                    >= threshold) {
-                                                        historyCompressor.compress(conversationId);
-                                                    }
-                                                } catch (Exception e) {
-                                                    log.warn(
-                                                            "chat.stream_history_write_failed"
-                                                                    + " conv_id={}, reason={}",
-                                                            conversationId,
-                                                            e.getMessage());
-                                                }
+                                            if (!streamRefusal && isMultiTurnEnabled()) {
+                                                conversationHistoryWriter.recordSuccessfulTurn(
+                                                        conversationId,
+                                                        streamCtx,
+                                                        cmd.query(),
+                                                        finalAnswer,
+                                                        alignedCitations);
                                             }
                                             // 流正常结束 → 发 DoneEvent(拒答时 LLM_DEGRADED)
                                             return reactor.core.publisher.Flux.just(
