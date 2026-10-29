@@ -78,9 +78,21 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
+      - name: Publish Trivy findings as check annotations
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s trivy-results.sarif ]; then
+            echo "::error file=.github/workflows/production-gates.yml::Trivy did not produce SARIF output"
+            exit 1
+          fi
+          jq -r '.runs[].results[]? | [(.locations[0].physicalLocation.artifactLocation.uri // "."), ((.locations[0].physicalLocation.region.startLine // 1) | tostring), (.ruleId // "trivy"), (.message.text // "vulnerability")] | @tsv' trivy-results.sarif |
+          while IFS=$'\t' read -r path line rule message; do
+            echo "::error file=${path},line=${line},title=${rule}::${message}"
+          done
       - name: Upload security findings
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
       - name: Generate CycloneDX SBOM
